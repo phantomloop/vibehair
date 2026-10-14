@@ -13,12 +13,13 @@
 
 use std::fs::{File, OpenOptions, TryLockError};
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 use eframe::egui::{CentralPanel, Frame};
 use eframe::{App, CreationContext, Frame as EframeFrame, NativeOptions};
 
 use crate::config::{self, Settings};
-use crate::geometry::{window_outer_pos_points, window_size_px};
+use crate::geometry::{window_outer_pos_points, window_pos_on_monitor_px, window_size_px};
 use crate::render::paint_crosshair;
 
 /// Viewport flags for the overlay window. Shared so tests can assert intent.
@@ -45,6 +46,44 @@ pub fn viewport_builder(mode: crate::config::Transparency) -> egui::ViewportBuil
         // Alpha mode uses the windowing system's transparency.
         (_, true) => builder.with_transparent(true),
         (_, false) => builder.with_transparent(true).with_mouse_passthrough(true),
+    }
+}
+
+/// Re-assert the overlay's Z-order and repair its styles.
+///
+/// `Some(styles_repaired)` on Windows, `None` where there is nothing to do.
+fn enforce_overlay(frame: &mut EframeFrame, settings: &Settings) -> Option<bool> {
+    #[cfg(target_os = "windows")]
+    {
+        let window = frame.winit_window().cloned()?;
+        match crate::platform_windows::enforce_overlay(
+            &window,
+            settings.color,
+            settings.transparency,
+        ) {
+            Ok(repaired) => Some(repaired),
+            Err(err) => {
+                crate::platform::log_line(&format!("vibehair: topmost watchdog failed: {err}"));
+                None
+            }
+        }
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = (frame, settings);
+        None
+    }
+}
+
+/// Monitor (physical pixels) that currently has focus, when the platform can say.
+fn foreground_monitor() -> Option<(f32, f32, f32, f32)> {
+    #[cfg(target_os = "windows")]
+    {
+        crate::platform_windows::foreground_monitor_rect()
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        None
     }
 }
 
@@ -78,6 +117,12 @@ fn configure_window(frame: &mut EframeFrame, settings: &Settings) -> bool {
         true
     }
 }
+
+/// How often the overlay re-asserts its topmost position and checks that its
+/// window styles are intact. A borderless game re-asserts its own `HWND_TOPMOST`
+/// after us, which would leave the crosshair behind the game; one cheap Win32
+/// call per second wins that race and costs a fraction of one egui pass.
+const WATCHDOG_INTERVAL: Duration = Duration::from_secs(1);
 
 /// Window side in physical pixels for these settings.
 fn desired_side_px(settings: &Settings) -> u32 {
@@ -158,6 +203,11 @@ pub struct OverlayApp {
     /// Platform window setup attempts so far (a style change needs a frame
     /// change, so the first attempt may not stick; one retry is allowed).
     configure_attempts: u8,
+    /// When the next topmost/style watchdog tick is due.
+    next_watchdog: Instant,
+    /// Monitor (physical pixels) the crosshair is placed on: the one showing the
+    /// foreground window, so a game on a secondary screen still gets it.
+    target_monitor: Option<(f32, f32, f32, f32)>,
 }
 
 impl OverlayApp {
@@ -176,6 +226,8 @@ impl OverlayApp {
             monitor_wait: 8,
             _lock: lock,
             configure_attempts: 0,
+            next_watchdog: Instant::now(),
+            target_monitor: None,
         }
     }
 }
@@ -189,6 +241,31 @@ impl App for OverlayApp {
                 self.configure_attempts = 2;
             }
         }
+
+        // Keep the crosshair above the game and wake up once a second to do so.
+        let now = Instant::now();
+        if now >= self.next_watchdog {
+            self.next_watchdog = now + WATCHDOG_INTERVAL;
+            if let Some(repair) = enforce_overlay(frame, &self.settings) {
+                if repair {
+                    crate::platform::log_line(
+                        "vibehair: overlay styles were reset by another window; repaired",
+                    );
+                }
+                match foreground_monitor() {
+                    Some(rect) if self.target_monitor != Some(rect) => {
+                        crate::platform::log_line(&format!(
+                            "vibehair: crosshair follows the focused monitor at {},{} {}x{} px",
+                            rect.0, rect.1, rect.2, rect.3
+                        ));
+                        self.target_monitor = Some(rect);
+                    }
+                    _ => {}
+                }
+            }
+        }
+        ui.ctx().request_repaint_after(WATCHDOG_INTERVAL);
+
         let ctx = ui.ctx().clone();
         let ppp = ctx.pixels_per_point().max(0.5);
         let side = desired_side_px(&self.settings);
@@ -207,7 +284,22 @@ impl App for OverlayApp {
         let monitor = ctx
             .input(|i| i.viewport().monitor_size)
             .unwrap_or(egui::Vec2::ZERO);
-        if monitor.x > 1.0 && monitor.y > 1.0 {
+        if let Some(rect) = self.target_monitor {
+            // Position on the monitor that has focus, in physical pixels, then
+            // convert to the points `OuterPosition` expects.
+            let (x_px, y_px) = window_pos_on_monitor_px(
+                rect,
+                (side as f32, side as f32),
+                (self.settings.offset_x, self.settings.offset_y),
+            );
+            let want = (x_px / ppp, y_px / ppp);
+            if self.applied.pos != Some(want) {
+                self.applied.pos = Some(want);
+                ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(egui::pos2(
+                    want.0, want.1,
+                )));
+            }
+        } else if monitor.x > 1.0 && monitor.y > 1.0 {
             let want = desired_outer_points(&self.settings, side, monitor, ppp);
             if self.applied.pos != Some(want) {
                 self.applied.pos = Some(want);
@@ -487,16 +579,23 @@ mod tests {
         let mut app = OverlayApp::new(&cc, lock);
 
         let mut size_sends = 0;
-        let mut repaint_requests = 0;
-        let mut last_delay = Duration::ZERO;
+        let mut immediate_repaints = 0;
+        let mut last_delay = Duration::MAX;
         for _ in 0..16 {
             let (commands, delay) = run_pass(&ctx, &mut app);
             size_sends += commands
                 .iter()
                 .filter(|cmd| matches!(cmd, egui::ViewportCommand::InnerSize(_)))
                 .count();
-            if delay < Duration::MAX {
-                repaint_requests += 1;
+            if delay == Duration::ZERO {
+                immediate_repaints += 1;
+            } else {
+                // Between the startup passes and the watchdog cadence nothing
+                // may schedule a faster redraw - that is what a busy loop is.
+                assert!(
+                    delay >= WATCHDOG_INTERVAL - Duration::from_millis(100),
+                    "intermediate repaint cadence: {delay:?}"
+                );
             }
             last_delay = delay;
         }
@@ -505,13 +604,14 @@ mod tests {
             "window size must be applied once, not every frame"
         );
         assert!(
-            repaint_requests <= 12,
-            "repaint requests must be bounded during startup, got {repaint_requests}"
+            immediate_repaints <= 12,
+            "only startup may repaint immediately, got {immediate_repaints} of 16 passes"
         );
-        assert_eq!(
-            last_delay,
-            Duration::MAX,
-            "overlay must idle without repainting"
+        // egui rounds the requested delay to frame boundaries, so allow a frame.
+        assert!(
+            last_delay <= WATCHDOG_INTERVAL
+                && last_delay >= WATCHDOG_INTERVAL - Duration::from_millis(100),
+            "steady state must sleep at the watchdog cadence, got {last_delay:?}"
         );
     }
 }

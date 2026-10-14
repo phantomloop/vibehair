@@ -1,6 +1,6 @@
 [package]
 name = "vibehair"
-version = "0.1.0"
+version = "0.1.5"
 edition = "2024"
 description = "A minimalist crosshair game overlay for Windows and Linux."
 

@@ -36,6 +36,11 @@ const SWP_NOMOVE: u32 = 0x0002;
 const SWP_NOZORDER: u32 = 0x0004;
 const SWP_NOACTIVATE: u32 = 0x0010;
 const SWP_FRAMECHANGED: u32 = 0x0020;
+const SWP_NOOWNERZORDER: u32 = 0x0200;
+
+/// `SetWindowPos` insert-after value that puts a window in the topmost band.
+const HWND_TOPMOST: isize = -1;
+const MONITOR_DEFAULTTONEAREST: u32 = 2;
 
 const LWA_COLORKEY: u32 = 0x0000_0001;
 
@@ -49,8 +54,29 @@ fn colorref(r: u8, g: u8, b: u8) -> u32 {
     u32::from(r) | (u32::from(g) << 8) | (u32::from(b) << 16)
 }
 
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct WinRect {
+    left: i32,
+    top: i32,
+    right: i32,
+    bottom: i32,
+}
+
+#[repr(C)]
+#[derive(Default)]
+struct MonitorInfo {
+    cb_size: u32,
+    rc_monitor: WinRect,
+    rc_work: WinRect,
+    dw_flags: u32,
+}
+
 #[link(name = "user32")]
 unsafe extern "system" {
+    fn GetForegroundWindow() -> isize;
+    fn MonitorFromWindow(hwnd: isize, flags: u32) -> isize;
+    fn GetMonitorInfoW(monitor: isize, info: *mut MonitorInfo) -> i32;
     fn GetWindowLongPtrW(hwnd: isize, index: i32) -> isize;
     fn SetWindowLongPtrW(hwnd: isize, index: i32, value: isize) -> isize;
     fn SetLayeredWindowAttributes(hwnd: isize, key: u32, alpha: u8, flags: u32) -> i32;
@@ -82,6 +108,106 @@ pub fn overlay_style(ex_style: u32, mode: crate::config::Transparency) -> u32 {
         crate::config::Transparency::Key => base | WS_EX_LAYERED,
         crate::config::Transparency::Alpha => base & !WS_EX_LAYERED,
     }
+}
+
+/// Monitor rectangle `(x, y, width, height)` in physical pixels that contains
+/// `hwnd`. Reading another window's monitor is a plain query: the overlay never
+/// touches or modifies the game's window or process.
+fn monitor_rect_of(hwnd: isize) -> Option<(f32, f32, f32, f32)> {
+    if hwnd == 0 {
+        return None;
+    }
+    // Safety: only queries the monitor of an existing window handle.
+    unsafe {
+        let monitor = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
+        if monitor == 0 {
+            return None;
+        }
+        let mut info = MonitorInfo {
+            cb_size: size_of::<MonitorInfo>() as u32,
+            ..Default::default()
+        };
+        if GetMonitorInfoW(monitor, &mut info) == 0 {
+            return None;
+        }
+        let r = info.rc_monitor;
+        Some((
+            r.left as f32,
+            r.top as f32,
+            (r.right - r.left) as f32,
+            (r.bottom - r.top) as f32,
+        ))
+    }
+}
+
+/// Monitor showing the window that currently has keyboard focus - normally the
+/// game. `None` when there is no foreground window (desktop, lock screen).
+pub fn foreground_monitor_rect() -> Option<(f32, f32, f32, f32)> {
+    // Safety: `GetForegroundWindow` may return null, which is handled.
+    monitor_rect_of(unsafe { GetForegroundWindow() })
+}
+
+fn hwnd_of(window: &winit::window::Window) -> Result<isize, String> {
+    let handle = window
+        .window_handle()
+        .map_err(|err| format!("no window handle: {err}"))?;
+    match handle.as_raw() {
+        RawWindowHandle::Win32(win32) => Ok(win32.hwnd.get()),
+        _ => Err("unexpected window handle kind".to_owned()),
+    }
+}
+
+/// Keep the overlay above the game.
+///
+/// A borderless game re-asserts `HWND_TOPMOST` on its own window (and Windows
+/// can drop styles when a window is re-shown), which leaves the overlay behind
+/// the game even though it was created topmost. Re-asserting our own topmost
+/// state at a low, fixed cadence wins that race without ever touching the
+/// game's window or process.
+///
+/// Returns `true` when the extended styles had to be repaired.
+pub fn enforce_overlay(
+    window: &winit::window::Window,
+    crosshair_rgb: [u8; 3],
+    mode: crate::config::Transparency,
+) -> Result<bool, String> {
+    let hwnd = hwnd_of(window)?;
+
+    // Safety: `hwnd` belongs to our own live window; the calls only change that
+    // window's Z-order position flags and (if needed) its styles. `SWP_NOACTIVATE`
+    // keeps focus with the game.
+    unsafe {
+        SetWindowPos(
+            hwnd,
+            HWND_TOPMOST,
+            0,
+            0,
+            0,
+            0,
+            SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOOWNERZORDER,
+        );
+
+        let current = GetWindowLongPtrW(hwnd, GWL_EXSTYLE) as u32;
+        let wanted = overlay_style(current, mode);
+        if current == wanted {
+            return Ok(false);
+        }
+        SetWindowLongPtrW(hwnd, GWL_EXSTYLE, wanted as isize);
+        let _ = SetWindowPos(
+            hwnd,
+            HWND_TOPMOST,
+            0,
+            0,
+            0,
+            0,
+            SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOOWNERZORDER | SWP_FRAMECHANGED,
+        );
+        if matches!(mode.effective(), crate::config::Transparency::Key) {
+            let [r, g, b] = crate::platform::overlay_key_rgb(crosshair_rgb);
+            let _ = SetLayeredWindowAttributes(hwnd, colorref(r, g, b), 0, LWA_COLORKEY);
+        }
+    }
+    Ok(true)
 }
 
 /// Make the overlay a keyed, click-through window. Failures are logged, never fatal.

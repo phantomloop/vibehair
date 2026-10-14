@@ -125,6 +125,22 @@ pub fn window_outer_pos_points(
     (x, y)
 }
 
+/// Outer window position for a monitor whose rect is `monitor_px` = (x, y, w, h)
+/// in physical pixels (the origin can be negative on secondary monitors).
+/// The window is centered in the monitor and shifted by `offset_px`; `window_px`
+/// is the window size in physical pixels. The result is in physical pixels.
+pub fn window_pos_on_monitor_px(
+    monitor_px: (f32, f32, f32, f32),
+    window_px: (f32, f32),
+    offset_px: (i32, i32),
+) -> (f32, f32) {
+    let (mx, my, mw, mh) = monitor_px;
+    (
+        mx + (mw - window_px.0) / 2.0 + offset_px.0 as f32,
+        my + (mh - window_px.1) / 2.0 + offset_px.1 as f32,
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -207,6 +223,24 @@ mod tests {
         assert_eq!((x, y), (910.0, 490.0));
         let (x, y) = window_outer_pos_points((1920.0, 1080.0), (100.0, 100.0), (10, -20), 1.0);
         assert_eq!((x, y), (920.0, 470.0));
+    }
+
+    #[test]
+    fn monitor_position_centers_and_handles_negative_origins() {
+        assert_eq!(
+            window_pos_on_monitor_px((0.0, 0.0, 1920.0, 1080.0), (100.0, 100.0), (0, 0)),
+            (910.0, 490.0)
+        );
+        // A monitor to the left of the primary one has negative coordinates.
+        assert_eq!(
+            window_pos_on_monitor_px((-1920.0, 0.0, 1920.0, 1080.0), (100.0, 100.0), (0, 0)),
+            (-1010.0, 490.0)
+        );
+        // A monitor above the primary one: the center is at -1080 + 490 = -590.
+        assert_eq!(
+            window_pos_on_monitor_px((0.0, -1080.0, 1920.0, 1080.0), (100.0, 100.0), (5, -5)),
+            (915.0, -595.0)
+        );
     }
 
     #[test]

@@ -31,6 +31,14 @@
   viewport builder and must NOT be layered. `window.set_undecorated_shadow(false)` is mandatory:
   egui-winit enables winit's drop shadow for borderless windows, which draws a 1px line on top.
   Verify with `cargo clippy --target x86_64-pc-windows-msvc --all-targets -- -D warnings`.
+- Staying above the game (`platform_windows::enforce_overlay`, called once per second from the
+  overlay): a borderless game re-asserts its own `HWND_TOPMOST` after us and Windows can drop
+  window styles, so the watchdog re-asserts `SetWindowPos(HWND_TOPMOST, .., SWP_NOACTIVATE)` and
+  repairs styles if they changed. `WATCHDOG_INTERVAL` is the cadence: one egui pass per second is
+  the whole cost (16 passes measure <10 ms in release). The overlay NEVER touches another process
+  or another process's window - only its own HWND; the monitor to place the crosshair on is picked
+  by *querying* the foreground window's monitor (`GetForegroundWindow` + `MonitorFromWindow`), so a
+  game on a secondary screen still gets the crosshair.
 - Diagnostics: `platform::log_line` writes `vibehair.log` next to the settings file, because a
   `windows_subsystem = "windows"` process has no visible stderr.
 - Windows release builds link the CRT statically (`.cargo/config.toml`); `release.yml` fails if
