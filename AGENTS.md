@@ -39,6 +39,11 @@
   or another process's window - only its own HWND; the monitor to place the crosshair on is picked
   by *querying* the foreground window's monitor (`GetForegroundWindow` + `MonitorFromWindow`), so a
   game on a secondary screen still gets the crosshair.
+- Centering is a closed loop (`geometry::center_correction_px`): the window manager can place a
+  window a pixel or two off (borders, DPI rounding, truncation) and odd window sizes put the
+  geometric center between two pixels, so the overlay measures its real client rect
+  (`ViewportInfo::inner_rect`), snaps it like the painter does, and nudges the window until the
+  drawn crosshair center sits on `monitor center + offsets`. Dead zone 1 px, single-step clamp 64 px.
 - Diagnostics: `platform::log_line` writes `vibehair.log` next to the settings file, because a
   `windows_subsystem = "windows"` process has no visible stderr.
 - Windows release builds link the CRT statically (`.cargo/config.toml`); `release.yml` fails if

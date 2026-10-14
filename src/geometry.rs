@@ -141,6 +141,42 @@ pub fn window_pos_on_monitor_px(
     )
 }
 
+/// Dead zone for the placement correction, in physical pixels: below this the
+/// window is considered centered and is left alone (avoids jitter).
+pub const CENTER_DEAD_ZONE_PX: f32 = 1.0;
+
+/// Largest correction the closed loop may apply in one step, in physical
+/// pixels. A placement bug must never be able to fling the window away.
+pub const MAX_CENTER_CORRECTION_PX: f32 = 64.0;
+
+/// Offset to add to the window position so the drawn crosshair center lands on
+/// `desired_center_px`, given the center that was actually measured.
+///
+/// A window manager can place a window a pixel or two away from the requested
+/// position (borders, DPI rounding, truncation), and odd window sizes put the
+/// geometric center between two pixels, so the overlay measures where it ended
+/// up and nudges itself instead of trusting the request.
+pub fn center_correction_px(
+    desired_center_px: (f32, f32),
+    observed_center_px: (f32, f32),
+) -> (f32, f32) {
+    let clamp = |value: f32| {
+        if !value.is_finite() {
+            return 0.0;
+        }
+        let value = value.clamp(-MAX_CENTER_CORRECTION_PX, MAX_CENTER_CORRECTION_PX);
+        if value.abs() < CENTER_DEAD_ZONE_PX {
+            0.0
+        } else {
+            value
+        }
+    };
+    (
+        clamp(desired_center_px.0 - observed_center_px.0),
+        clamp(desired_center_px.1 - observed_center_px.1),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -223,6 +259,41 @@ mod tests {
         assert_eq!((x, y), (910.0, 490.0));
         let (x, y) = window_outer_pos_points((1920.0, 1080.0), (100.0, 100.0), (10, -20), 1.0);
         assert_eq!((x, y), (920.0, 470.0));
+    }
+
+    #[test]
+    fn center_correction_closes_the_gap_and_ignores_jitter() {
+        // A perfect placement needs no correction.
+        assert_eq!(
+            center_correction_px((960.0, 540.0), (960.0, 540.0)),
+            (0.0, 0.0)
+        );
+        // Sub-pixel and dead-zone differences are left alone.
+        assert_eq!(
+            center_correction_px((960.0, 540.0), (959.5, 539.2)),
+            (0.0, 0.0)
+        );
+        // A one-pixel placement error is corrected in the right direction.
+        assert_eq!(
+            center_correction_px((960.0, 540.0), (958.0, 543.0)),
+            (2.0, -3.0)
+        );
+        // Nonsense measurements cannot fling the window away.
+        assert_eq!(
+            center_correction_px((960.0, 540.0), (-9999.0, f32::NAN)),
+            (64.0, 0.0)
+        );
+        // Converges: after one correction the error is gone.
+        let desired = (500.0, 300.0);
+        let mut outer = (0.0, 0.0);
+        let mut observed = (498.0, 302.0); // the window manager moved us by (2, -2)
+        for _ in 0..2 {
+            let (dx, dy) = center_correction_px(desired, observed);
+            outer = (outer.0 + dx, outer.1 + dy);
+            observed = (observed.0 + dx, observed.1 + dy);
+        }
+        assert_eq!(observed, desired);
+        assert_eq!(outer, (2.0, -2.0));
     }
 
     #[test]
