@@ -1,29 +1,42 @@
 //! Windows-only window setup for the overlay.
 //!
-//! Two framework behaviours have to be corrected here:
+//! Three framework/OS behaviours have to be corrected here:
 //!
 //! 1. Click-through must not come from winit's `mouse_passthrough`: it adds
 //!    `WS_EX_LAYERED` without any layer attributes, and Windows then stops
 //!    compositing the window content at all, so the crosshair disappears
 //!    (emilk/egui#2537, still open upstream).
 //! 2. Transparency must not come from winit's `with_transparent` either: that
-//!    path enables DWM blur-behind, which on Windows 11 renders the window as
-//!    a glassy, shadowed blob instead of clean pixels.
+//!    path enables DWM blur-behind, which renders the tiny window as a glassy,
+//!    shadowed blob instead of clean pixels.
+//! 3. egui-winit enables winit's undecorated drop shadow for borderless
+//!    windows; per winit's own documentation that "causes a thin 1px line to
+//!    appear on the top of the window", which is exactly the artifact users
+//!    see above the crosshair.
 //!
 //! Instead the window keeps its own pixels and Windows makes one key color
 //! transparent (`LWA_COLORKEY`), i.e. exactly the crosshair is visible. The
-//! DWM shadow, Win11 rounded corners and non-client rendering are switched off
-//! so nothing is drawn around or over those pixels.
+//! shadow, Win11 rounded corners and non-client rendering are switched off so
+//! nothing is drawn around or over those pixels.
 
+use winit::platform::windows::WindowExtWindows as _;
 use winit::raw_window_handle::{HasWindowHandle as _, RawWindowHandle};
 
 use crate::platform::log_line;
 
 const GWL_EXSTYLE: i32 = -20;
+
 const WS_EX_TRANSPARENT: u32 = 0x0000_0020;
 const WS_EX_LAYERED: u32 = 0x0008_0000;
 const WS_EX_TOOLWINDOW: u32 = 0x0000_0080;
 const WS_EX_NOACTIVATE: u32 = 0x0800_0000;
+
+const SWP_NOSIZE: u32 = 0x0001;
+const SWP_NOMOVE: u32 = 0x0002;
+const SWP_NOZORDER: u32 = 0x0004;
+const SWP_NOACTIVATE: u32 = 0x0010;
+const SWP_FRAMECHANGED: u32 = 0x0020;
+
 const LWA_COLORKEY: u32 = 0x0000_0001;
 
 const DWMWA_NCRENDERING_POLICY: u32 = 2;
@@ -41,6 +54,15 @@ unsafe extern "system" {
     fn GetWindowLongPtrW(hwnd: isize, index: i32) -> isize;
     fn SetWindowLongPtrW(hwnd: isize, index: i32, value: isize) -> isize;
     fn SetLayeredWindowAttributes(hwnd: isize, key: u32, alpha: u8, flags: u32) -> i32;
+    fn SetWindowPos(
+        hwnd: isize,
+        insert_after: isize,
+        x: i32,
+        y: i32,
+        cx: i32,
+        cy: i32,
+        flags: u32,
+    ) -> i32;
 }
 
 #[link(name = "dwmapi")]
@@ -48,17 +70,32 @@ unsafe extern "system" {
     fn DwmSetWindowAttribute(hwnd: isize, attribute: u32, value: *const u32, size: u32) -> i32;
 }
 
-/// Extended style for the overlay: composited (layered), keyed, click-through,
-/// hidden from the taskbar and never activated.
-pub fn overlay_style(ex_style: u32) -> u32 {
-    ex_style | WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE
+/// Extended style for the overlay: click-through, hidden from the taskbar,
+/// never activated, plus `WS_EX_LAYERED` in key mode only.
+///
+/// In alpha mode the window must *not* be layered: a layered window without
+/// layer attributes stops Windows from compositing the content at all, which
+/// is the invisible-crosshair bug (emilk/egui#2537).
+pub fn overlay_style(ex_style: u32, mode: crate::config::Transparency) -> u32 {
+    let base = ex_style | WS_EX_TRANSPARENT | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE;
+    match mode.effective() {
+        crate::config::Transparency::Key => base | WS_EX_LAYERED,
+        crate::config::Transparency::Alpha => base & !WS_EX_LAYERED,
+    }
 }
 
 /// Make the overlay a keyed, click-through window. Failures are logged, never fatal.
+///
+/// Safe to call repeatedly: the caller may retry once, because a style change
+/// only takes effect after the window manager processes a frame change.
 pub fn configure_overlay_window(
     window: &winit::window::Window,
     crosshair_rgb: [u8; 3],
+    mode: crate::config::Transparency,
 ) -> Result<(), String> {
+    // Removes the 1px shadow line winit draws above undecorated windows.
+    window.set_undecorated_shadow(false);
+
     let handle = window
         .window_handle()
         .map_err(|err| format!("no window handle: {err}"))?;
@@ -66,19 +103,43 @@ pub fn configure_overlay_window(
         return Err("unexpected window handle kind".to_owned());
     };
     let hwnd = win32.hwnd.get();
+    let key = match mode.effective() {
+        crate::config::Transparency::Key => {
+            let [r, g, b] = crate::platform::overlay_key_rgb(crosshair_rgb);
+            Some(colorref(r, g, b))
+        }
+        crate::config::Transparency::Alpha => None,
+    };
 
     // Safety: `hwnd` belongs to a live winit window on this thread; the calls
-    // only read/write that window's styles and DWM attributes.
+    // only read and write that window's styles, position flags and DWM
+    // attributes.
     unsafe {
-        let current = GetWindowLongPtrW(hwnd, GWL_EXSTYLE) as u32;
-        let wanted = overlay_style(current);
-        SetWindowLongPtrW(hwnd, GWL_EXSTYLE, wanted as isize);
+        let before = GetWindowLongPtrW(hwnd, GWL_EXSTYLE) as u32;
+        SetWindowLongPtrW(hwnd, GWL_EXSTYLE, overlay_style(before, mode) as isize);
 
-        // The key color becomes fully transparent; alpha is unused with a key.
-        let [r, g, b] = crate::platform::overlay_key_rgb(crosshair_rgb);
-        if SetLayeredWindowAttributes(hwnd, colorref(r, g, b), 0, LWA_COLORKEY) == 0 {
-            return Err("SetLayeredWindowAttributes(LWA_COLORKEY) failed".to_owned());
+        // Style changes are only applied on a frame change; the layer
+        // attributes below are rejected until then.
+        let _ = SetWindowPos(
+            hwnd,
+            0,
+            0,
+            0,
+            0,
+            0,
+            SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED,
+        );
+
+        if let Some(key) = key {
+            // The key color becomes fully transparent; alpha is unused with a key.
+            if SetLayeredWindowAttributes(hwnd, key, 0, LWA_COLORKEY) == 0 {
+                return Err(format!(
+                    "SetLayeredWindowAttributes(LWA_COLORKEY, {key:#010x}) failed"
+                ));
+            }
         }
+        // In alpha mode the window keeps the per-pixel transparency requested
+        // through the viewport builder (`with_transparent`); nothing to do here.
 
         // No DWM shadow, no rounded corners, nothing drawn around our pixels.
         let ncrp = DWMNCRP_DISABLED;
@@ -96,12 +157,25 @@ pub fn configure_overlay_window(
             size_of::<u32>() as u32,
         );
 
-        let applied = GetWindowLongPtrW(hwnd, GWL_EXSTYLE) as u32;
-        if applied & WS_EX_LAYERED == 0 || applied & WS_EX_TRANSPARENT == 0 {
-            return Err(format!("overlay styles not applied: {applied:#010x}"));
+        let after = GetWindowLongPtrW(hwnd, GWL_EXSTYLE) as u32;
+        let layered = after & WS_EX_LAYERED != 0;
+        if after & WS_EX_TRANSPARENT == 0 {
+            return Err(format!("click-through style not applied: {after:#010x}"));
         }
+        let want_layered = matches!(mode.effective(), crate::config::Transparency::Key);
+        if layered != want_layered {
+            return Err(format!(
+                "window layer mode is wrong: layered={layered}, want={want_layered} ({after:#010x})"
+            ));
+        }
+        log_line(&format!(
+            "vibehair: overlay window configured (styles {before:#010x} -> {after:#010x}, key {}, no shadow)",
+            match key {
+                Some(key) => format!("{key:#010x}"),
+                None => "none (alpha mode)".to_owned(),
+            }
+        ));
     }
-    log_line("vibehair: overlay window configured (layered color key, click-through)");
     Ok(())
 }
 
@@ -110,8 +184,16 @@ mod tests {
     use super::*;
 
     #[test]
-    fn overlay_style_is_layered_click_through_and_hidden() {
-        let style = overlay_style(0);
+    fn colorref_uses_bbggrr_order() {
+        assert_eq!(colorref(0, 0, 0), 0x0000_0000);
+        assert_eq!(colorref(255, 0, 255), 0x00FF_00FF);
+        assert_eq!(colorref(0x12, 0x34, 0x56), 0x0056_3412);
+    }
+
+    #[test]
+    fn key_mode_is_layered_and_click_through() {
+        use crate::config::Transparency;
+        let style = overlay_style(0, Transparency::Key);
         assert_ne!(
             style & WS_EX_LAYERED,
             0,
@@ -122,16 +204,25 @@ mod tests {
         assert_ne!(style & WS_EX_NOACTIVATE, 0, "must not steal focus");
     }
 
+    /// A layered window without layer attributes is exactly the bug that made
+    /// the crosshair invisible, so alpha mode must actively drop the flag.
     #[test]
-    fn colorref_uses_bbggrr_order() {
-        assert_eq!(colorref(0, 0, 0), 0x0000_0000);
-        assert_eq!(colorref(255, 0, 255), 0x00FF_00FF);
-        assert_eq!(colorref(0x12, 0x34, 0x56), 0x0056_3412);
+    fn alpha_mode_drops_layered_and_keeps_click_through() {
+        use crate::config::Transparency;
+        let style = overlay_style(WS_EX_LAYERED | WS_EX_TOOLWINDOW, Transparency::Alpha);
+        assert_eq!(style & WS_EX_LAYERED, 0, "alpha mode must not be layered");
+        assert_ne!(style & WS_EX_TRANSPARENT, 0, "click-through stays");
+        assert_ne!(style & WS_EX_TOOLWINDOW, 0, "taskbar hiding stays");
     }
 
     #[test]
-    fn overlay_style_keeps_unrelated_bits() {
+    fn overlay_style_keeps_unrelated_bits_and_is_idempotent() {
+        use crate::config::Transparency;
         let existing = 0x0000_0008; // WS_EX_TOPMOST
-        assert_eq!(overlay_style(existing) & 0x0000_0008, 0x0000_0008);
+        for mode in [Transparency::Key, Transparency::Alpha] {
+            let once = overlay_style(existing, mode);
+            assert_eq!(once & 0x0000_0008, 0x0000_0008, "{mode:?}");
+            assert_eq!(overlay_style(once, mode), once, "retries must be safe");
+        }
     }
 }

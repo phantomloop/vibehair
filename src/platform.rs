@@ -46,16 +46,20 @@ pub fn hide_console(cmd: &mut std::process::Command) {
     let _ = cmd;
 }
 
-/// Color the overlay clears to. On Windows this exact color is made
-/// transparent by the layer key, so it must be one the crosshair never draws
-/// by accident: black, or magenta when the crosshair itself is black
-/// (elsewhere the window is genuinely transparent and alpha is used).
-pub fn overlay_clear_color_for(crosshair: [u8; 3]) -> [f32; 4] {
-    if cfg!(target_os = "windows") {
-        let [r, g, b] = overlay_key_rgb(crosshair);
-        [r as f32 / 255.0, g as f32 / 255.0, b as f32 / 255.0, 1.0]
-    } else {
-        [0.0, 0.0, 0.0, 0.0]
+/// Color the overlay clears to.
+///
+/// In `key` mode this exact color is made transparent by the layer key, so it
+/// must be one the crosshair never draws by accident: black, or magenta when
+/// the crosshair itself is black. In `alpha` mode the window is genuinely
+/// transparent and the clear color is fully transparent.
+pub fn overlay_clear_color_for(crosshair: [u8; 3], mode: crate::config::Transparency) -> [f32; 4] {
+    use crate::config::Transparency;
+    match mode.effective() {
+        Transparency::Key => {
+            let [r, g, b] = overlay_key_rgb(crosshair);
+            [r as f32 / 255.0, g as f32 / 255.0, b as f32 / 255.0, 1.0]
+        }
+        Transparency::Alpha => [0.0, 0.0, 0.0, 0.0],
     }
 }
 
@@ -114,13 +118,20 @@ mod tests {
     }
 
     #[test]
-    fn overlay_clear_color_is_opaque_only_on_windows() {
-        let color = overlay_clear_color_for([0, 255, 0]);
-        assert_eq!(&color[..3], &[0.0, 0.0, 0.0]);
+    fn overlay_clear_color_follows_the_transparency_mode() {
+        use crate::config::Transparency;
+        // Alpha mode is genuinely transparent everywhere.
+        assert_eq!(
+            overlay_clear_color_for([0, 255, 0], Transparency::Alpha),
+            [0.0, 0.0, 0.0, 0.0]
+        );
+        // Key mode needs an opaque key color; only Windows honours it.
+        let keyed = overlay_clear_color_for([0, 255, 0], Transparency::Key);
+        assert_eq!(&keyed[..3], &[0.0, 0.0, 0.0]);
         #[cfg(target_os = "windows")]
-        assert_eq!(color[3], 1.0, "the key color must be opaque to be visible");
+        assert_eq!(keyed[3], 1.0, "the key color must be opaque to be visible");
         #[cfg(not(target_os = "windows"))]
-        assert_eq!(color[3], 0.0, "other platforms use real transparency");
+        assert_eq!(keyed[3], 0.0, "key mode resolves to alpha off Windows");
     }
 
     #[test]
@@ -131,6 +142,9 @@ mod tests {
         assert_eq!(overlay_key_rgb([0, 0, 0]), [255, 0, 255]);
         // The keyed color is only used where a key is actually applied.
         #[cfg(target_os = "windows")]
-        assert_ne!(overlay_clear_color_for([0, 0, 0])[..3], [0.0, 0.0, 0.0]);
+        assert_ne!(
+            overlay_clear_color_for([0, 0, 0], crate::config::Transparency::Key)[..3],
+            [0.0, 0.0, 0.0]
+        );
     }
 }

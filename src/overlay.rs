@@ -29,7 +29,7 @@ use crate::render::paint_crosshair;
 /// its pixels and Windows makes one key color transparent - see
 /// [`crate::platform_windows::configure_overlay_window`]. Other platforms use
 /// the regular transparent, click-through viewport.
-pub fn viewport_builder() -> egui::ViewportBuilder {
+pub fn viewport_builder(mode: crate::config::Transparency) -> egui::ViewportBuilder {
     let builder = egui::ViewportBuilder::default()
         .with_title("vibehair overlay")
         .with_decorations(false)
@@ -38,32 +38,44 @@ pub fn viewport_builder() -> egui::ViewportBuilder {
         .with_taskbar(false)
         .with_has_shadow(false)
         .with_active(false);
-    if cfg!(target_os = "windows") {
-        builder
-    } else {
-        builder.with_transparent(true).with_mouse_passthrough(true)
+    match (mode.effective(), cfg!(target_os = "windows")) {
+        // Windows key mode: an opaque window whose key color is switched off
+        // by Windows, so no windowing transparency is requested at all.
+        (crate::config::Transparency::Key, true) => builder,
+        // Alpha mode uses the windowing system's transparency.
+        (_, true) => builder.with_transparent(true),
+        (_, false) => builder.with_transparent(true).with_mouse_passthrough(true),
     }
 }
 
 /// Apply the platform window setup (Windows: keyed color + click-through).
 ///
-/// Called once per process; failures are logged, never fatal.
-fn configure_window(frame: &mut EframeFrame, settings: &Settings) {
+/// Called once per process (retried once); failures are logged, never fatal.
+/// Returns `true` when nothing further needs doing.
+fn configure_window(frame: &mut EframeFrame, settings: &Settings) -> bool {
     #[cfg(target_os = "windows")]
     {
         let Some(window) = frame.winit_window().cloned() else {
             crate::platform::log_line("vibehair: overlay window handle unavailable");
-            return;
+            return false;
         };
-        if let Err(err) = crate::platform_windows::configure_overlay_window(&window, settings.color)
-        {
-            crate::platform::log_line(&format!("vibehair: overlay window setup failed: {err}"));
+        match crate::platform_windows::configure_overlay_window(
+            &window,
+            settings.color,
+            settings.transparency,
+        ) {
+            Ok(()) => true,
+            Err(err) => {
+                crate::platform::log_line(&format!("vibehair: overlay window setup failed: {err}"));
+                false
+            }
         }
     }
     #[cfg(not(target_os = "windows"))]
     {
         // Other platforms configure click-through through the viewport flags.
         let _ = (frame, settings);
+        true
     }
 }
 
@@ -143,8 +155,9 @@ pub struct OverlayApp {
     monitor_wait: u8,
     /// Holds the single-instance lock for the process lifetime, when available.
     _lock: Option<File>,
-    /// Platform window setup runs once, as soon as a window handle exists.
-    window_configured: bool,
+    /// Platform window setup attempts so far (a style change needs a frame
+    /// change, so the first attempt may not stick; one retry is allowed).
+    configure_attempts: u8,
 }
 
 impl OverlayApp {
@@ -162,16 +175,19 @@ impl OverlayApp {
             settle_frames: 0,
             monitor_wait: 8,
             _lock: lock,
-            window_configured: false,
+            configure_attempts: 0,
         }
     }
 }
 
 impl App for OverlayApp {
     fn ui(&mut self, ui: &mut egui::Ui, frame: &mut EframeFrame) {
-        if !self.window_configured {
-            self.window_configured = true;
-            configure_window(frame, &self.settings);
+        if self.configure_attempts < 2 {
+            self.configure_attempts += 1;
+            let ok = configure_window(frame, &self.settings);
+            if ok {
+                self.configure_attempts = 2;
+            }
         }
         let ctx = ui.ctx().clone();
         let ppp = ctx.pixels_per_point().max(0.5);
@@ -220,14 +236,14 @@ impl App for OverlayApp {
     /// transparency (see [`crate::platform_windows::configure_overlay_window`]);
     /// elsewhere the window itself is transparent.
     fn clear_color(&self, _visuals: &egui::Visuals) -> [f32; 4] {
-        crate::platform::overlay_clear_color_for(self.settings.color)
+        crate::platform::overlay_clear_color_for(self.settings.color, self.settings.transparency)
     }
 }
 
 /// Native options for the overlay window.
-pub fn native_options() -> NativeOptions {
+pub fn native_options(settings: &Settings) -> NativeOptions {
     NativeOptions {
-        viewport: viewport_builder().with_inner_size([64.0, 64.0]),
+        viewport: viewport_builder(settings.transparency).with_inner_size([64.0, 64.0]),
         ..Default::default()
     }
 }
@@ -247,9 +263,12 @@ pub fn run() -> eframe::Result {
             None
         }
     };
+    // The transparency mode decides how the window is created, and the
+    // settings are loaded again inside the app; both must agree.
+    let (settings, _path, _err) = config::load();
     eframe::run_native(
         "vibehair overlay",
-        native_options(),
+        native_options(&settings),
         Box::new(move |cc| Ok(Box::new(OverlayApp::new(cc, lock)))),
     )
 }
@@ -281,7 +300,8 @@ mod tests {
 
     #[test]
     fn overlay_requests_transparent_click_through_topmost() {
-        let vb = viewport_builder();
+        use crate::config::Transparency;
+        let vb = viewport_builder(Transparency::Key);
         assert_eq!(vb.decorations, Some(false));
         #[cfg(not(target_os = "windows"))]
         {
@@ -301,7 +321,8 @@ mod tests {
 
     #[test]
     fn overlay_starts_hidden_from_taskbar_without_focus() {
-        let vb = viewport_builder();
+        use crate::config::Transparency;
+        let vb = viewport_builder(Transparency::Key);
         assert_eq!(vb.taskbar, Some(false));
         assert_eq!(vb.active, Some(false));
         assert_eq!(vb.has_shadow, Some(false));

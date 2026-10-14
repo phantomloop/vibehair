@@ -32,6 +32,41 @@ fn clamp_finite(value: f32, fallback: f32, min: f32, max: f32) -> f32 {
     }
 }
 
+/// How the overlay window is made transparent.
+///
+/// `Key` is the deterministic Windows default: the window keeps its own pixels
+/// and one key color is made fully transparent. `Alpha` uses per-pixel alpha
+/// (DWM blur-behind on Windows). Only `Alpha` is meaningful off Windows.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Transparency {
+    /// Opaque window with one transparent key color (Windows).
+    Key,
+    /// Per-pixel alpha through the windowing system.
+    Alpha,
+}
+
+impl Default for Transparency {
+    fn default() -> Self {
+        if cfg!(target_os = "windows") {
+            Self::Key
+        } else {
+            Self::Alpha
+        }
+    }
+}
+
+impl Transparency {
+    /// The mode actually used on the running platform.
+    pub fn effective(self) -> Self {
+        if cfg!(target_os = "windows") {
+            self
+        } else {
+            Self::Alpha
+        }
+    }
+}
+
 /// All user-adjustable crosshair settings. Field names are the TOML keys.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Settings {
@@ -51,6 +86,9 @@ pub struct Settings {
         serialize_with = "se_color"
     )]
     pub color: [u8; 3],
+    /// Overlay transparency mechanism; defaults to `key` on Windows.
+    #[serde(default)]
+    pub transparency: Transparency,
     /// Manual X offset from screen center, in physical pixels.
     pub offset_x: i32,
     /// Manual Y offset from screen center, in physical pixels (down is positive).
@@ -92,6 +130,7 @@ impl Default for Settings {
             thickness: 2.0,
             opacity: 1.0,
             color: default_color(),
+            transparency: Transparency::default(),
             offset_x: 0,
             offset_y: 0,
         }
@@ -259,6 +298,7 @@ mod tests {
             thickness: 1.25,
             opacity: 0.8,
             color: [255, 0, 128],
+            transparency: Transparency::Alpha,
             offset_x: -40,
             offset_y: 120,
         };
@@ -292,6 +332,40 @@ mod tests {
         assert!(err.is_none());
         assert_eq!(back, s);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn transparency_has_a_platform_default_and_round_trips() {
+        assert_eq!(Settings::default().transparency, Transparency::default());
+        if cfg!(target_os = "windows") {
+            assert_eq!(Transparency::default(), Transparency::Key);
+        } else {
+            assert_eq!(Transparency::default(), Transparency::Alpha);
+        }
+        // A config file written before this option existed still loads.
+        let full = toml::to_string(&Settings::default()).unwrap();
+        let without = full
+            .lines()
+            .filter(|line| !line.starts_with("transparency"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let upgraded: Settings = toml::from_str(&without).unwrap();
+        assert_eq!(upgraded.transparency, Transparency::default());
+        // Both values survive a write/read cycle.
+        for mode in [Transparency::Key, Transparency::Alpha] {
+            let s = Settings {
+                transparency: mode,
+                ..Settings::default()
+            };
+            let text = toml::to_string(&s).unwrap();
+            let back: Settings = toml::from_str(&text).unwrap();
+            assert_eq!(back.transparency, mode);
+        }
+        // Off Windows, `key` is meaningless and resolves to alpha.
+        #[cfg(not(target_os = "windows"))]
+        assert_eq!(Transparency::Key.effective(), Transparency::Alpha);
+        #[cfg(target_os = "windows")]
+        assert_eq!(Transparency::Key.effective(), Transparency::Key);
     }
 
     #[test]

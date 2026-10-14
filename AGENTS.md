@@ -22,9 +22,14 @@
   Tested by `render::tests` (physical size, stroke width, and a no-clipping check per DPI scale).
 - Windows overlay (`platform_windows.rs`): neither winit `mouse_passthrough` (adds `WS_EX_LAYERED`
   without layer attributes → content is not composited, crosshair invisible; emilk/egui#2537) nor
-  `with_transparent` (DWM blur-behind → glassy, shadowed blob on Win11) is used. Instead the window
-  is opaque, `SetLayeredWindowAttributes(.., LWA_COLORKEY)` makes one key color transparent, and
-  DWM shadow/rounded corners are disabled. Click-through comes from `WS_EX_TRANSPARENT`.
+  `with_transparent` (DWM blur-behind → glassy, shadowed blob on Win11) is used by default. Instead
+  the window is opaque, `SetLayeredWindowAttributes(.., LWA_COLORKEY)` makes one key color
+  transparent, and DWM shadow/rounded corners are disabled. Click-through comes from
+  `WS_EX_TRANSPARENT`. A style change only takes effect after `SetWindowPos(.., SWP_FRAMECHANGED)`,
+  so window setup is retried once. `Settings::transparency` (`key` | `alpha`) selects the mechanism
+  and is user-settable in `vibehair.toml`; `alpha` requests per-pixel transparency through the
+  viewport builder and must NOT be layered. `window.set_undecorated_shadow(false)` is mandatory:
+  egui-winit enables winit's drop shadow for borderless windows, which draws a 1px line on top.
   Verify with `cargo clippy --target x86_64-pc-windows-msvc --all-targets -- -D warnings`.
 - Diagnostics: `platform::log_line` writes `vibehair.log` next to the settings file, because a
   `windows_subsystem = "windows"` process has no visible stderr.
