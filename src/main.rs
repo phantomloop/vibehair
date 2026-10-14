@@ -11,6 +11,7 @@ mod platform;
 mod platform_windows;
 mod render;
 mod state;
+mod widgets;
 
 use std::ffi::OsString;
 

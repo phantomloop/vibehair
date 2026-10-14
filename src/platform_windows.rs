@@ -75,6 +75,7 @@ struct MonitorInfo {
 #[link(name = "user32")]
 unsafe extern "system" {
     fn GetForegroundWindow() -> isize;
+    fn GetWindowRect(hwnd: isize, rect: *mut WinRect) -> i32;
     fn MonitorFromWindow(hwnd: isize, flags: u32) -> isize;
     fn GetMonitorInfoW(monitor: isize, info: *mut MonitorInfo) -> i32;
     fn GetWindowLongPtrW(hwnd: isize, index: i32) -> isize;
@@ -140,11 +141,33 @@ fn monitor_rect_of(hwnd: isize) -> Option<(f32, f32, f32, f32)> {
     }
 }
 
-/// Monitor showing the window that currently has keyboard focus - normally the
-/// game. `None` when there is no foreground window (desktop, lock screen).
-pub fn foreground_monitor_rect() -> Option<(f32, f32, f32, f32)> {
-    // Safety: `GetForegroundWindow` may return null, which is handled.
-    monitor_rect_of(unsafe { GetForegroundWindow() })
+/// Monitor of the foreground window, but only when that window **fills** it.
+///
+/// Following the focused window's monitor unconditionally made the crosshair
+/// jump to the other screen whenever the user alt-tabbed (reported: a second
+/// monitor at 2560,357 was picked while the game ran on the first one). A
+/// window that covers its monitor is a game in borderless fullscreen, which is
+/// the case the overlay wants to follow; anything else leaves the crosshair
+/// where it is.
+pub fn foreground_fullscreen_monitor_rect() -> Option<(f32, f32, f32, f32)> {
+    // Safety: handles are queried, never modified; null is handled.
+    let hwnd = unsafe { GetForegroundWindow() };
+    if hwnd == 0 {
+        return None;
+    }
+    let mut rect = WinRect::default();
+    // Safety: `rect` is a valid out-parameter and the handle was just obtained.
+    if unsafe { GetWindowRect(hwnd, &mut rect) } == 0 {
+        return None;
+    }
+    let monitor = monitor_rect_of(hwnd)?;
+    let covers =
+        |span: i32, monitor_span: f32| monitor_span > 1.0 && span as f32 >= monitor_span * 0.95;
+    if covers(rect.right - rect.left, monitor.2) && covers(rect.bottom - rect.top, monitor.3) {
+        Some(monitor)
+    } else {
+        None
+    }
 }
 
 fn hwnd_of(window: &winit::window::Window) -> Result<isize, String> {

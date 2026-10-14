@@ -1,64 +1,107 @@
-//! Startup selector: Open Editor / Launch Overlay.
+//! Startup selector and overlay control panel.
 //!
 //! The chosen mode is spawned as a child process: winit allows exactly one
 //! event loop per process, so a second `run_native` in-process would fail.
-//! Spawning happens exactly once; the launcher then closes (bug: repeated
-//! spawns while the close request was still in flight).
+//! This window stays open so the overlay can be started *and stopped*: without
+//! it, a click-through overlay that covers the screen had to be killed from the
+//! task manager (reported).
+//!
+//! Stopping works across processes through [`crate::platform::request_overlay_stop`],
+//! so an overlay started by another copy of the executable is stopped too.
 
-use std::process::Command;
+use std::process::{Child, Command};
+use std::time::{Duration, Instant};
 
 use eframe::egui::CentralPanel;
 use eframe::{App, CreationContext, Frame as EframeFrame, NativeOptions};
 
 use crate::platform;
+use crate::widgets::rainbow_title;
 
-enum Next {
-    None,
-    Editor,
-    Overlay,
-}
-
-fn flag(next: &Next) -> Option<&'static str> {
-    match next {
-        Next::None => None,
-        Next::Editor => Some("--editor"),
-        Next::Overlay => Some("--overlay"),
-    }
-}
-
-/// Relaunch this exe with `flag`. Returns the error message on failure.
-fn spawn_self(flag: &str) -> Result<(), String> {
+/// Relaunch this exe in `mode`. Returns the error message on failure.
+fn spawn_self(mode: crate::state::Mode, child: &mut Option<Child>) -> Result<(), String> {
     let exe = std::env::current_exe().map_err(|err| format!("cannot locate own exe: {err}"))?;
+    let flag = match mode {
+        crate::state::Mode::Editor => "--editor",
+        crate::state::Mode::Overlay => "--overlay",
+        crate::state::Mode::Launcher => return Ok(()),
+    };
     let mut cmd = Command::new(exe);
     cmd.arg(flag);
     platform::hide_console(&mut cmd);
-    cmd.spawn().map_err(|err| format!("launch failed: {err}"))?;
+    let spawned = cmd.spawn().map_err(|err| format!("launch failed: {err}"))?;
+    if mode == crate::state::Mode::Overlay {
+        *child = Some(spawned);
+    }
     Ok(())
 }
 
 pub struct LauncherApp {
-    next: Next,
-    /// Set once a mode has been spawned, so a pending close cannot spawn twice.
-    launched: bool,
+    /// The overlay this window started, if any.
+    overlay: Option<Child>,
+    status: String,
     error: Option<String>,
+    /// Cached "is an overlay running" answer, probed at most twice a second
+    /// (this window repaints continuously for the wordmark animation).
+    running: bool,
+    running_checked_at: Instant,
 }
+
+/// How long a running-state probe is reused.
+const RUNNING_PROBE_INTERVAL: Duration = Duration::from_millis(500);
 
 impl LauncherApp {
     pub fn new(_cc: &CreationContext<'_>) -> Self {
         Self {
-            next: Next::None,
-            launched: false,
+            overlay: None,
+            status: String::new(),
             error: None,
+            running: !crate::overlay::overlay_lock_available(),
+            running_checked_at: Instant::now(),
         }
     }
 
-    /// The flag to spawn, taken at most once. Returns `None` on every later
-    /// call, so the frames between requesting a close and the close arriving
-    /// cannot spawn the chosen mode a second time.
-    fn take_pending_spawn(&mut self) -> Option<&'static str> {
-        let wanted = flag(&self.next);
-        self.next = Next::None;
-        if self.launched { None } else { wanted }
+    /// `true` when an overlay runs, whoever started it.
+    fn overlay_running(&mut self) -> bool {
+        if self.running_checked_at.elapsed() >= RUNNING_PROBE_INTERVAL {
+            self.running_checked_at = Instant::now();
+            self.running = !crate::overlay::overlay_lock_available();
+        }
+        self.running
+    }
+
+    /// Force the next `overlay_running` call to probe again.
+    fn refresh_running(&mut self) {
+        self.running_checked_at = Instant::now() - RUNNING_PROBE_INTERVAL;
+    }
+
+    fn start_overlay(&mut self) {
+        self.error = None;
+        // A leftover request from a previous session must not kill the overlay
+        // we are about to start.
+        let _ = platform::take_overlay_stop_request();
+        match spawn_self(crate::state::Mode::Overlay, &mut self.overlay) {
+            Ok(()) => {
+                self.status = "overlay started".to_owned();
+                self.refresh_running();
+            }
+            Err(err) => self.error = Some(err),
+        }
+    }
+
+    fn stop_overlay(&mut self) {
+        self.error = None;
+        if let Some(mut child) = self.overlay.take() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+        match platform::request_overlay_stop() {
+            Ok(()) => {
+                self.status = "overlay stop requested".to_owned();
+                self.refresh_running();
+            }
+            Err(err) => self.error = Some(format!("cannot request stop: {err}")),
+        }
     }
 }
 
@@ -66,29 +109,47 @@ impl App for LauncherApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut EframeFrame) {
         CentralPanel::default().show(ui, |ui| {
             ui.vertical_centered(|ui| {
-                ui.heading("vibehair");
-                ui.add_space(8.0);
-                if ui.button("open editor").clicked() && !self.launched {
-                    self.next = Next::Editor;
-                }
-                if ui.button("launch overlay").clicked() && !self.launched {
-                    self.next = Next::Overlay;
-                }
-                if let Some(flag) = self.take_pending_spawn() {
-                    // Spawn exactly once; keep the window open on failure.
-                    match spawn_self(flag) {
-                        Ok(()) => {
-                            self.launched = true;
-                            ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
-                        }
-                        Err(err) => self.error = Some(err),
+                rainbow_title(ui, "vibehair");
+                ui.add_space(10.0);
+
+                let running = self.overlay_running();
+                if ui.button("open editor").clicked() {
+                    let mut none = None;
+                    if let Err(err) = spawn_self(crate::state::Mode::Editor, &mut none) {
+                        self.error = Some(err);
                     }
                 }
+                if running {
+                    if ui.button("stop overlay").clicked() {
+                        self.stop_overlay();
+                    }
+                } else if ui.button("launch overlay").clicked() {
+                    self.start_overlay();
+                }
+
+                ui.add_space(6.0);
+                let state = if running {
+                    "overlay: running"
+                } else {
+                    "overlay: stopped"
+                };
+                ui.small(state);
+                if !self.status.is_empty() {
+                    ui.small(&self.status);
+                }
                 if let Some(err) = &self.error {
-                    ui.small(err);
+                    ui.colored_label(egui::Color32::from_rgb(220, 90, 90), err);
                 }
             });
         });
+    }
+
+    /// Closing this window also stops the overlay it started.
+    fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+        if let Some(mut child) = self.overlay.take() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
     }
 }
 
@@ -98,7 +159,7 @@ pub fn run() -> eframe::Result {
         NativeOptions {
             viewport: egui::ViewportBuilder::default()
                 .with_title("vibehair")
-                .with_inner_size([260.0, 180.0])
+                .with_inner_size([280.0, 220.0])
                 .with_resizable(false),
             ..Default::default()
         },
@@ -110,49 +171,26 @@ pub fn run() -> eframe::Result {
 mod tests {
     use super::*;
 
-    #[test]
-    fn flags_map_to_modes() {
-        assert_eq!(flag(&Next::Editor), Some("--editor"));
-        assert_eq!(flag(&Next::Overlay), Some("--overlay"));
-        assert_eq!(flag(&Next::None), None);
+    fn launcher() -> LauncherApp {
+        LauncherApp::new(&CreationContext::_new_kittest(egui::Context::default()))
     }
 
     #[test]
-    fn launcher_starts_idle_and_allows_a_single_spawn() {
-        let app = LauncherApp::new(&CreationContext::_new_kittest(egui::Context::default()));
-        assert!(!app.launched);
-        assert_eq!(flag(&app.next), None);
+    fn launcher_starts_idle_without_an_overlay_child() {
+        let app = launcher();
+        assert!(app.overlay.is_none());
         assert!(app.error.is_none());
     }
 
-    /// Regression test: the click used to be re-processed on the frames before
-    /// the close request took effect, spawning two editors.
+    /// The stop request must be consumable, so a stale request cannot stop the
+    /// next overlay the user starts.
     #[test]
-    fn a_choice_spawns_exactly_once() {
-        let mut app = LauncherApp::new(&CreationContext::_new_kittest(egui::Context::default()));
-        app.next = Next::Editor;
-        assert_eq!(app.take_pending_spawn(), Some("--editor"));
-        // Later frames before the window closes must not spawn again.
-        assert_eq!(app.take_pending_spawn(), None);
-        assert_eq!(app.take_pending_spawn(), None);
-        // After a successful spawn, a fresh choice is ignored too.
-        app.launched = true;
-        app.next = Next::Overlay;
-        assert_eq!(app.take_pending_spawn(), None);
-    }
-
-    #[test]
-    fn failed_spawn_leaves_the_launcher_open_for_retry() {
-        let mut app = LauncherApp::new(&CreationContext::_new_kittest(egui::Context::default()));
-        app.next = Next::Editor;
-        assert_eq!(app.take_pending_spawn(), Some("--editor"));
-        app.error = Some("launch failed".to_owned());
-        assert!(
-            !app.launched,
-            "a failure must not latch the launcher closed"
-        );
-        // The user can try again.
-        app.next = Next::Overlay;
-        assert_eq!(app.take_pending_spawn(), Some("--overlay"));
+    fn stop_requests_are_consumed_once() {
+        let mut launcher = launcher();
+        launcher.start_overlay();
+        assert!(platform::request_overlay_stop().is_ok());
+        assert!(platform::take_overlay_stop_request());
+        assert!(!platform::take_overlay_stop_request());
+        launcher.stop_overlay();
     }
 }

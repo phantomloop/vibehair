@@ -19,9 +19,7 @@ use eframe::egui::{CentralPanel, Frame};
 use eframe::{App, CreationContext, Frame as EframeFrame, NativeOptions};
 
 use crate::config::{self, Settings};
-use crate::geometry::{
-    center_correction_px, window_outer_pos_points, window_pos_on_monitor_px, window_size_px,
-};
+use crate::geometry::{window_outer_pos_points, window_pos_on_monitor_px, window_size_px};
 use crate::render::paint_crosshair;
 
 /// Viewport flags for the overlay window. Shared so tests can assert intent.
@@ -81,7 +79,7 @@ fn enforce_overlay(frame: &mut EframeFrame, settings: &Settings) -> Option<bool>
 fn foreground_monitor() -> Option<(f32, f32, f32, f32)> {
     #[cfg(target_os = "windows")]
     {
-        crate::platform_windows::foreground_monitor_rect()
+        crate::platform_windows::foreground_fullscreen_monitor_rect()
     }
     #[cfg(not(target_os = "windows"))]
     {
@@ -168,8 +166,13 @@ struct Applied {
 }
 
 /// Lock file path guarding against multiple simultaneous overlays.
+///
+/// It lives in the shared control directory rather than next to the settings,
+/// because every copy of the executable (old downloads, different folders) must
+/// contend for the *same* lock - otherwise each copy happily draws its own
+/// crosshair on top of the others.
 pub fn overlay_lock_path() -> PathBuf {
-    config::resolve_save_path().with_file_name("overlay.lock")
+    crate::platform::control_dir().join("overlay.lock")
 }
 
 /// Exclusive, non-blocking lock on `path`.
@@ -210,18 +213,9 @@ pub struct OverlayApp {
     /// Monitor (physical pixels) the crosshair is placed on: the one showing the
     /// foreground window, so a game on a secondary screen still gets it.
     target_monitor: Option<(f32, f32, f32, f32)>,
-    /// Set once the placement has been measured and corrected, so the log does
-    /// not repeat the same line every second.
-    centering_reported: bool,
 }
 
 impl OverlayApp {
-    /// Test hook: pretend the platform reported this monitor.
-    #[cfg(test)]
-    pub(crate) fn force_target_monitor(&mut self, rect: (f32, f32, f32, f32)) {
-        self.target_monitor = Some(rect);
-    }
-
     pub fn new(_cc: &CreationContext<'_>, lock: Option<File>) -> Self {
         let (settings, path, err) = config::load();
         if let Some(err) = err {
@@ -239,7 +233,6 @@ impl OverlayApp {
             configure_attempts: 0,
             next_watchdog: Instant::now(),
             target_monitor: None,
-            centering_reported: false,
         }
     }
 }
@@ -258,6 +251,10 @@ impl App for OverlayApp {
         let now = Instant::now();
         if now >= self.next_watchdog {
             self.next_watchdog = now + WATCHDOG_INTERVAL;
+            if crate::platform::take_overlay_stop_request() {
+                crate::platform::log_line("vibehair: stop requested; closing the overlay");
+                ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
+            }
             if let Some(repair) = enforce_overlay(frame, &self.settings) {
                 if repair {
                     crate::platform::log_line(
@@ -323,38 +320,6 @@ impl App for OverlayApp {
             // The OS reports the monitor size a frame or two in; retry briefly.
             self.monitor_wait -= 1;
             ctx.request_repaint();
-        }
-
-        // Closed loop for centering: a window manager may place the window a
-        // pixel or two off (borders, DPI rounding) and an odd window size puts
-        // the geometric center between pixels, so measure the client rect that
-        // was actually granted and nudge the window until the crosshair center
-        // sits exactly on the wanted point.
-        if let (Some(rect), Some(outer)) = (self.target_monitor, self.applied.pos)
-            && let Some(inner) = ctx.input(|i| i.viewport().inner_rect)
-        {
-            let desired_px = (
-                rect.0 + rect.2 / 2.0 + self.settings.offset_x as f32,
-                rect.1 + rect.3 / 2.0 + self.settings.offset_y as f32,
-            );
-            // Where the crosshair is actually drawn: the snapped client center.
-            let drawn = crate::render::snap_to_physical_pixel(inner.center(), ppp);
-            let observed_px = (drawn.x * ppp, drawn.y * ppp);
-            let (dx, dy) = center_correction_px(desired_px, observed_px);
-            if dx != 0.0 || dy != 0.0 {
-                let moved = (outer.0 + dx / ppp, outer.1 + dy / ppp);
-                self.applied.pos = Some(moved);
-                ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(egui::pos2(
-                    moved.0, moved.1,
-                )));
-                if !self.centering_reported {
-                    self.centering_reported = true;
-                    crate::platform::log_line(&format!(
-                        "vibehair: centered the crosshair by ({dx}, {dy}) px (wanted {},{} px, drawn at {},{} px)",
-                        desired_px.0, desired_px.1, observed_px.0, observed_px.1
-                    ));
-                }
-            }
         }
 
         if self.settle_frames > 0 {
@@ -611,91 +576,6 @@ mod tests {
             Some(out) => (out.commands.clone(), out.repaint_delay),
             None => (Vec::new(), std::time::Duration::MAX),
         }
-    }
-
-    /// Drive one pass with a given client rectangle, as the window manager
-    /// would report it.
-    fn run_pass_with_inner_rect(
-        ctx: &egui::Context,
-        app: &mut OverlayApp,
-        inner_rect: egui::Rect,
-    ) -> Vec<egui::ViewportCommand> {
-        let mut frame = EframeFrame::_new_kittest();
-        let mut raw = egui::RawInput::default();
-        raw.viewports
-            .entry(egui::ViewportId::ROOT)
-            .or_default()
-            .inner_rect = Some(inner_rect);
-        let mut output = ctx.run_ui(raw, |ui| {
-            app.ui(ui, &mut frame);
-        });
-        output.textures_delta.clear();
-        output
-            .viewport_output
-            .get(&egui::ViewportId::ROOT)
-            .map(|out| out.commands.clone())
-            .unwrap_or_default()
-    }
-
-    /// Reported: the crosshair sat a pixel or two off center. The window
-    /// manager can place a window slightly off the requested position, so the
-    /// overlay measures its client rect and corrects itself.
-    #[test]
-    fn overlay_recenters_itself_when_placed_off_center() {
-        use crate::geometry::window_size_px;
-        let ctx = egui::Context::default();
-        let lock = try_lock_file(&scratch("recenter").join("a.lock"))
-            .unwrap()
-            .unwrap();
-        let cc = CreationContext::_new_kittest(ctx.clone());
-        let mut app = OverlayApp::new(&cc, Some(lock));
-        app.force_target_monitor((0.0, 0.0, 1920.0, 1080.0));
-
-        let (side, _) = window_size_px(
-            app.settings.shape,
-            app.settings.size,
-            app.settings.gap,
-            app.settings.thickness,
-        );
-        let side = side as f32;
-        // Window was placed 2 px right and 3 px up of where the crosshair
-        // center should be (960, 540).
-        let inner = egui::Rect::from_min_size(egui::pos2(956.0, 528.0), egui::vec2(side, side));
-        assert_eq!(
-            inner.center(),
-            egui::pos2(956.0 + side / 2.0, 528.0 + side / 2.0)
-        );
-
-        let commands = run_pass_with_inner_rect(&ctx, &mut app, inner);
-        let positions: Vec<(f32, f32)> = commands
-            .iter()
-            .filter_map(|cmd| match cmd {
-                egui::ViewportCommand::OuterPosition(pos) => Some((pos.x, pos.y)),
-                _ => None,
-            })
-            .collect();
-        let (last_x, last_y) = *positions
-            .last()
-            .expect("the overlay must position its window");
-        // First placement centers the window on the monitor, ignoring any border.
-        let first = (960.0 - side / 2.0, 540.0 - side / 2.0);
-        assert_eq!(positions[0], first);
-        assert_ne!(
-            (last_x, last_y),
-            first,
-            "an off-center window must be corrected"
-        );
-
-        // The correction moves the window so the *client* center - the point the
-        // crosshair is drawn at - lands on the wanted screen position.
-        let applied = (last_x - first.0, last_y - first.1);
-        assert_eq!(
-            applied,
-            (960.0 - inner.center().x, 540.0 - inner.center().y),
-            "the nudge must equal the measured placement error (ppp = 1)"
-        );
-        let drawn_after_correction = (inner.center().x + applied.0, inner.center().y + applied.1);
-        assert_eq!(drawn_after_correction, (960.0, 540.0));
     }
 
     /// Regression test for the overlay burning CPU: the window size used to be

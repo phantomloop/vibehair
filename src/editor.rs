@@ -12,6 +12,7 @@ use crate::config::{
 use crate::geometry::Shape;
 use crate::platform;
 use crate::render::paint_crosshair;
+use crate::widgets::rainbow_title;
 
 pub struct EditorApp {
     settings: Settings,
@@ -99,7 +100,7 @@ fn shape_name(shape: Shape) -> &'static str {
 impl App for EditorApp {
     fn ui(&mut self, ui: &mut eframe::egui::Ui, _frame: &mut EframeFrame) {
         Panel::left("controls").resizable(false).show(ui, |ui| {
-            ui.heading("vibehair");
+            rainbow_title(ui, "vibehair");
             ui.separator();
             Grid::new("settings")
                 .num_columns(2)
@@ -171,6 +172,13 @@ impl App for EditorApp {
             if ui.button("launch overlay").clicked() {
                 self.save();
                 self.restart_overlay();
+            }
+            if ui.button("stop overlay").clicked() {
+                self.kill_overlay();
+                match platform::request_overlay_stop() {
+                    Ok(()) => self.status = "overlay stop requested".to_owned(),
+                    Err(err) => self.status = format!("cannot request stop: {err}"),
+                }
             }
             ui.separator();
             ui.small(&self.status);

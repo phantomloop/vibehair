@@ -34,6 +34,52 @@ pub fn user_config_file() -> Option<PathBuf> {
     })
 }
 
+/// Directory shared by *every* copy of vibehair for one user, regardless of
+/// where the executable lives. Used for the single-instance lock and for the
+/// stop request, so an overlay started by one copy can be found and stopped by
+/// another (reported problem: stale overlays from older downloads kept drawing
+/// their own crosshair because each install had its own lock file).
+pub fn control_dir() -> PathBuf {
+    #[cfg(target_os = "windows")]
+    {
+        if let Some(dir) = std::env::var_os("LOCALAPPDATA") {
+            return PathBuf::from(dir).join("vibehair");
+        }
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        if let Some(dir) = std::env::var_os("XDG_RUNTIME_DIR") {
+            return PathBuf::from(dir).join("vibehair");
+        }
+        if let Some(dir) = std::env::var_os("HOME") {
+            return PathBuf::from(dir).join(".cache").join("vibehair");
+        }
+    }
+    std::env::temp_dir().join("vibehair")
+}
+
+/// File whose presence asks a running overlay to close.
+pub fn stop_file_path() -> PathBuf {
+    control_dir().join("overlay.stop")
+}
+
+/// Ask any running overlay to close.
+pub fn request_overlay_stop() -> std::io::Result<()> {
+    let dir = control_dir();
+    std::fs::create_dir_all(&dir)?;
+    std::fs::write(stop_file_path(), b"stop\n")
+}
+
+/// Consume a pending stop request, if any.
+pub fn take_overlay_stop_request() -> bool {
+    let path = stop_file_path();
+    if path.is_file() {
+        let _ = std::fs::remove_file(&path);
+        return true;
+    }
+    false
+}
+
 /// Stop a spawned child from flashing a console window on Windows.
 pub fn hide_console(cmd: &mut std::process::Command) {
     #[cfg(target_os = "windows")]

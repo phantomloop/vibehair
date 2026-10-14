@@ -39,11 +39,20 @@
   or another process's window - only its own HWND; the monitor to place the crosshair on is picked
   by *querying* the foreground window's monitor (`GetForegroundWindow` + `MonitorFromWindow`), so a
   game on a secondary screen still gets the crosshair.
-- Centering is a closed loop (`geometry::center_correction_px`): the window manager can place a
-  window a pixel or two off (borders, DPI rounding, truncation) and odd window sizes put the
-  geometric center between two pixels, so the overlay measures its real client rect
-  (`ViewportInfo::inner_rect`), snaps it like the painter does, and nudges the window until the
-  drawn crosshair center sits on `monitor center + offsets`. Dead zone 1 px, single-step clamp 64 px.
+- Positioning is open loop and intentionally simple: the window is placed at
+  `monitor center + offsets` and re-sent only when the wanted value changes. A measured
+  closed-loop correction was tried in v0.1.6 and removed again: reading `inner_rect` in the same
+  pass that the position was requested measures a stale rect, and the resulting "corrections"
+  marched the window across the screen. Do not re-add self-correcting placement without a verified
+  settling delay, a large-error escape (re-send the absolute position) and a hard stop.
+- One overlay per *user*, not per executable copy: the instance lock lives in
+  `platform::control_dir()` (`%LOCALAPPDATA%\vibehair`, `$XDG_RUNTIME_DIR`/`~/.cache/vibehair`), so
+  stale overlays from older downloads cannot each draw their own crosshair.
+- Stopping an overlay: `platform::request_overlay_stop()` writes `overlay.stop` in the control
+  directory; the overlay's 1 Hz watchdog consumes it and closes. The launcher stays open as a
+  control panel (start/stop) and kills the overlay it started on exit; the editor has a stop button.
+- The `vibehair` wordmark is an animated rainbow (`widgets::rainbow_title`): hue varies along X and
+  advances with time. Only the launcher/editor pay for the animation repaints; the overlay does not.
 - Diagnostics: `platform::log_line` writes `vibehair.log` next to the settings file, because a
   `windows_subsystem = "windows"` process has no visible stderr.
 - Windows release builds link the CRT statically (`.cargo/config.toml`); `release.yml` fails if
