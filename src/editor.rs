@@ -181,9 +181,16 @@ impl App for EditorApp {
                 let (rect, _) =
                     ui.allocate_exact_size(ui.available_size(), eframe::egui::Sense::hover());
                 ui.set_clip_rect(rect);
-                // Checkerboard-ish dark backdrop via two-tone fill for visibility.
-                ui.painter().rect_filled(rect, 0.0, Color32::from_gray(24));
-                paint_crosshair(ui.painter(), rect.center(), &self.settings);
+                // Black backdrop: the overlay shows the crosshair over
+                // whatever is on screen, and its keyed-out background reads as
+                // black, so the preview matches the overlay closely.
+                ui.painter().rect_filled(rect, 0.0, Color32::BLACK);
+                paint_crosshair(
+                    ui.painter(),
+                    rect.center(),
+                    &self.settings,
+                    ui.ctx().pixels_per_point(),
+                );
             });
         });
     }

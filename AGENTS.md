@@ -17,13 +17,19 @@
   `overlay` (transparent/topmost/click-through), `platform` (exe-dir/user-config paths).
 - Overlay window: small square sized to the crosshair, centered via `monitor_size` + manual
   X/Y offsets, event-driven repaint (no idle loop). Game offset is user-calibrated; never guess it.
-- Windows overlay: `mouse_passthrough` MUST NOT be used — it makes winit add `WS_EX_LAYERED`,
-  after which Windows stops compositing the window's per-pixel-alpha content and the crosshair
-  disappears (emilk/egui#2537, open). Click-through is applied in `platform_windows.rs` by
-  setting `WS_EX_TRANSPARENT` without `WS_EX_LAYERED`. Verify with
-  `cargo clippy --target x86_64-pc-windows-msvc --all-targets -- -D warnings` (target is installed).
+- Crosshair sizes are **physical pixels**: `render::paint_crosshair` takes `pixels_per_point` and
+  converts to points, so the editor preview and the overlay show the same pixel size at any DPI.
+  Tested by `render::tests` (physical size, stroke width, and a no-clipping check per DPI scale).
+- Windows overlay (`platform_windows.rs`): neither winit `mouse_passthrough` (adds `WS_EX_LAYERED`
+  without layer attributes → content is not composited, crosshair invisible; emilk/egui#2537) nor
+  `with_transparent` (DWM blur-behind → glassy, shadowed blob on Win11) is used. Instead the window
+  is opaque, `SetLayeredWindowAttributes(.., LWA_COLORKEY)` makes one key color transparent, and
+  DWM shadow/rounded corners are disabled. Click-through comes from `WS_EX_TRANSPARENT`.
+  Verify with `cargo clippy --target x86_64-pc-windows-msvc --all-targets -- -D warnings`.
 - Diagnostics: `platform::log_line` writes `vibehair.log` next to the settings file, because a
   `windows_subsystem = "windows"` process has no visible stderr.
+- Windows release builds link the CRT statically (`.cargo/config.toml`); `release.yml` fails if
+  `VCRUNTIME140`/`MSVCP140` shows up in the exe, so users need no VC++ redistributable.
 - No game injection/hooks/drivers; plain user-space window. No telemetry.
 
 ## Working rules

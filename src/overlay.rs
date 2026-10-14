@@ -23,14 +23,15 @@ use crate::render::paint_crosshair;
 
 /// Viewport flags for the overlay window. Shared so tests can assert intent.
 ///
-/// Click-through is deliberately left to [`click_through`] on Windows: winit's
-/// `mouse_passthrough` would set `WS_EX_LAYERED`, and Windows then stops
-/// compositing our per-pixel-alpha content, so the window looks empty
-/// (emilk/egui#2537, still open upstream). Other platforms keep using it.
+/// On Windows neither `with_transparent` (DWM blur-behind renders a glassy,
+/// shadowed blob) nor `mouse_passthrough` (adds `WS_EX_LAYERED` without layer
+/// attributes, hiding the content; emilk/egui#2537) is used: the window keeps
+/// its pixels and Windows makes one key color transparent - see
+/// [`crate::platform_windows::configure_overlay_window`]. Other platforms use
+/// the regular transparent, click-through viewport.
 pub fn viewport_builder() -> egui::ViewportBuilder {
     let builder = egui::ViewportBuilder::default()
         .with_title("vibehair overlay")
-        .with_transparent(true)
         .with_decorations(false)
         .with_resizable(false)
         .with_always_on_top()
@@ -40,27 +41,29 @@ pub fn viewport_builder() -> egui::ViewportBuilder {
     if cfg!(target_os = "windows") {
         builder
     } else {
-        builder.with_mouse_passthrough(true)
+        builder.with_transparent(true).with_mouse_passthrough(true)
     }
 }
 
-/// Make the overlay click-through, without turning it invisible.
+/// Apply the platform window setup (Windows: keyed color + click-through).
 ///
 /// Called once per process; failures are logged, never fatal.
-fn click_through(frame: &mut EframeFrame) {
+fn configure_window(frame: &mut EframeFrame, settings: &Settings) {
     #[cfg(target_os = "windows")]
     {
         let Some(window) = frame.winit_window().cloned() else {
             crate::platform::log_line("vibehair: overlay window handle unavailable");
             return;
         };
-        if let Err(err) = crate::platform_windows::make_click_through(&window) {
-            crate::platform::log_line(&format!("vibehair: click-through failed: {err}"));
+        if let Err(err) = crate::platform_windows::configure_overlay_window(&window, settings.color)
+        {
+            crate::platform::log_line(&format!("vibehair: overlay window setup failed: {err}"));
         }
     }
     #[cfg(not(target_os = "windows"))]
     {
-        let _ = frame;
+        // Other platforms configure click-through through the viewport flags.
+        let _ = (frame, settings);
     }
 }
 
@@ -140,8 +143,8 @@ pub struct OverlayApp {
     monitor_wait: u8,
     /// Holds the single-instance lock for the process lifetime, when available.
     _lock: Option<File>,
-    /// Click-through is applied once, as soon as a window handle exists.
-    click_through_done: bool,
+    /// Platform window setup runs once, as soon as a window handle exists.
+    window_configured: bool,
 }
 
 impl OverlayApp {
@@ -159,16 +162,16 @@ impl OverlayApp {
             settle_frames: 0,
             monitor_wait: 8,
             _lock: lock,
-            click_through_done: false,
+            window_configured: false,
         }
     }
 }
 
 impl App for OverlayApp {
     fn ui(&mut self, ui: &mut egui::Ui, frame: &mut EframeFrame) {
-        if !self.click_through_done {
-            self.click_through_done = true;
-            click_through(frame);
+        if !self.window_configured {
+            self.window_configured = true;
+            configure_window(frame, &self.settings);
         }
         let ctx = ui.ctx().clone();
         let ppp = ctx.pixels_per_point().max(0.5);
@@ -209,14 +212,15 @@ impl App for OverlayApp {
 
         CentralPanel::default().frame(Frame::NONE).show(ui, |ui| {
             let center = ui.max_rect().center();
-            paint_crosshair(ui.painter(), center, &self.settings);
+            paint_crosshair(ui.painter(), center, &self.settings, ppp);
         });
     }
 
-    /// Transparent background: the crosshair must be the only visible content.
-    /// eframe's default (rgba 12,12,12,180) would paint a visible dark box.
+    /// Only the crosshair may be visible. Windows turns the key color into
+    /// transparency (see [`crate::platform_windows::configure_overlay_window`]);
+    /// elsewhere the window itself is transparent.
     fn clear_color(&self, _visuals: &egui::Visuals) -> [f32; 4] {
-        [0.0, 0.0, 0.0, 0.0]
+        crate::platform::overlay_clear_color_for(self.settings.color)
     }
 }
 
@@ -281,10 +285,16 @@ mod tests {
         assert_eq!(vb.transparent, Some(true));
         assert_eq!(vb.decorations, Some(false));
         #[cfg(not(target_os = "windows"))]
-        assert_eq!(vb.mouse_passthrough, Some(true));
-        // Windows applies WS_EX_TRANSPARENT itself instead (see overlay::click_through).
+        {
+            assert_eq!(vb.mouse_passthrough, Some(true));
+            assert_eq!(vb.transparent, Some(true));
+        }
+        // Windows configures the native window itself instead.
         #[cfg(target_os = "windows")]
-        assert_eq!(vb.mouse_passthrough, None);
+        {
+            assert_eq!(vb.mouse_passthrough, None);
+            assert_eq!(vb.transparent, None);
+        }
         assert_eq!(vb.window_level, Some(egui::WindowLevel::AlwaysOnTop));
         assert_eq!(vb.resizable, Some(false));
     }

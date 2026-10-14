@@ -46,19 +46,26 @@ pub fn hide_console(cmd: &mut std::process::Command) {
     let _ = cmd;
 }
 
-/// Extended window style bit that makes a window click-through.
-#[cfg(target_os = "windows")]
-pub const WS_EX_TRANSPARENT: u32 = 0x0000_0020;
-/// Extended window style bit that hands compositing to the app; on Windows it
-/// stops DWM from compositing our per-pixel-alpha content, which makes the
-/// window invisible (winit sets it for `mouse_passthrough`, see emilk/egui#2537).
-#[cfg(target_os = "windows")]
-pub const WS_EX_LAYERED: u32 = 0x0008_0000;
+/// Color the overlay clears to. On Windows this exact color is made
+/// transparent by the layer key, so it must be one the crosshair never draws
+/// by accident: black, or magenta when the crosshair itself is black
+/// (elsewhere the window is genuinely transparent and alpha is used).
+pub fn overlay_clear_color_for(crosshair: [u8; 3]) -> [f32; 4] {
+    if cfg!(target_os = "windows") {
+        let [r, g, b] = overlay_key_rgb(crosshair);
+        [r as f32 / 255.0, g as f32 / 255.0, b as f32 / 255.0, 1.0]
+    } else {
+        [0.0, 0.0, 0.0, 0.0]
+    }
+}
 
-/// Extended window style for a click-through overlay that still composites.
-#[cfg(target_os = "windows")]
-pub fn click_through_style(ex_style: u32) -> u32 {
-    (ex_style | WS_EX_TRANSPARENT) & !WS_EX_LAYERED
+/// The color keyed out on Windows: black, or magenta for a black crosshair.
+pub fn overlay_key_rgb(crosshair: [u8; 3]) -> [u8; 3] {
+    if crosshair == [0, 0, 0] {
+        [255, 0, 255]
+    } else {
+        [0, 0, 0]
+    }
 }
 
 /// Diagnostics file, resolved once next to the settings file.
@@ -106,22 +113,24 @@ mod tests {
         hide_console(&mut cmd);
     }
 
-    #[cfg(target_os = "windows")]
     #[test]
-    fn click_through_style_adds_transparent_and_drops_layered() {
-        // Window created without any extended styles:
-        assert_eq!(click_through_style(0), WS_EX_TRANSPARENT);
-        // winit's mouse_passthrough variant must lose WS_EX_LAYERED:
-        let layered_and_click_through = WS_EX_TRANSPARENT | WS_EX_LAYERED;
-        assert_eq!(
-            click_through_style(layered_and_click_through),
-            WS_EX_TRANSPARENT
-        );
-        // Unrelated styles (topmost, no-activate, toolwindow) survive:
-        let others = 0x0000_0008 | 0x0800_0000 | 0x0000_0080 | WS_EX_LAYERED;
-        assert_eq!(
-            click_through_style(others),
-            (others | WS_EX_TRANSPARENT) & !WS_EX_LAYERED
-        );
+    fn overlay_clear_color_is_opaque_only_on_windows() {
+        let color = overlay_clear_color_for([0, 255, 0]);
+        assert_eq!(&color[..3], &[0.0, 0.0, 0.0]);
+        #[cfg(target_os = "windows")]
+        assert_eq!(color[3], 1.0, "the key color must be opaque to be visible");
+        #[cfg(not(target_os = "windows"))]
+        assert_eq!(color[3], 0.0, "other platforms use real transparency");
+    }
+
+    #[test]
+    fn a_black_crosshair_is_never_the_key_color() {
+        assert_eq!(overlay_key_rgb([0, 255, 0]), [0, 0, 0]);
+        assert_eq!(overlay_key_rgb([255, 255, 255]), [0, 0, 0]);
+        // A black crosshair would vanish if black were keyed out:
+        assert_eq!(overlay_key_rgb([0, 0, 0]), [255, 0, 255]);
+        // The keyed color is only used where a key is actually applied.
+        #[cfg(target_os = "windows")]
+        assert_ne!(overlay_clear_color_for([0, 0, 0])[..3], [0.0, 0.0, 0.0]);
     }
 }
