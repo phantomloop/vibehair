@@ -4,10 +4,12 @@
 //! manual offsets. Event-driven: viewport commands are sent only when the
 //! desired geometry actually changes, and repaint requests are bounded.
 //!
-//! Platform notes: transparency, topmost, undecorated and mouse-passthrough
-//! are requested through eframe/winit viewport flags, which is the documented
-//! path on Windows. Actual on-screen behavior in Hunt: Showdown is unverified
-//! (no Windows game machine here) and is marked so in the release checklist.
+//! Platform notes: transparency, topmost and undecorated come from eframe/winit
+//! viewport flags. Click-through is platform-specific: on Windows the Win32
+//! style is applied directly (see [`click_through`]), elsewhere the viewport
+//! `mouse_passthrough` flag is used. Actual on-screen behavior in Hunt:
+//! Showdown is unverified (no Windows game machine here) and is marked so in
+//! the release checklist.
 
 use std::fs::{File, OpenOptions, TryLockError};
 use std::path::{Path, PathBuf};
@@ -180,7 +182,7 @@ impl App for OverlayApp {
                 side as f32 / ppp,
                 side as f32 / ppp,
             )));
-            self.settle_frames = 2; // REGRESSION-PROBE
+            self.settle_frames = 2;
         }
 
         let monitor = ctx
