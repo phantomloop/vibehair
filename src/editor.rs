@@ -50,6 +50,12 @@ impl EditorApp {
     /// Start an overlay, replacing any overlay this editor started before.
     fn restart_overlay(&mut self) {
         self.kill_overlay();
+        // Our own overlay is gone now; a still-held lock means someone else's
+        // overlay is running and would make the new process exit at once.
+        if !crate::overlay::overlay_lock_available() {
+            self.status = "an overlay is already running".to_owned();
+            return;
+        }
         match launch_overlay_child() {
             Ok(child) => {
                 self.overlay = Some(child);

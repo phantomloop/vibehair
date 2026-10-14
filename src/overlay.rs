@@ -248,6 +248,11 @@ pub fn run() -> eframe::Result {
     )
 }
 
+/// `true` when no other overlay process currently holds the single-instance lock.
+pub fn overlay_lock_available() -> bool {
+    matches!(try_lock_file(&overlay_lock_path()), Ok(Some(_)))
+}
+
 /// `Ok(None)` when another overlay process already holds the lock.
 fn acquire_overlay_lock() -> Result<Option<File>, String> {
     let path = overlay_lock_path();
