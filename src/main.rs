@@ -9,6 +9,8 @@ mod overlay;
 mod platform;
 #[cfg(target_os = "windows")]
 mod platform_windows;
+#[cfg(all(test, feature = "preview-render"))]
+mod preview;
 mod render;
 mod state;
 mod widgets;

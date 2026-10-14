@@ -1,6 +1,6 @@
 [package]
 name = "vibehair"
-version = "0.1.7"
+version = "0.1.8"
 edition = "2024"
 description = "A minimalist crosshair game overlay for Windows and Linux."
 
@@ -10,10 +10,19 @@ egui = { version = "0.36", default-features = false }
 serde = { version = "1", features = ["derive"] }
 toml = "1"
 
+# Only built for `--features preview-render` (see [[example]] above).
+egui_kittest = { version = "0.36", features = ["wgpu", "snapshot"], optional = true }
+
 # Needed for the platform window handle behind the Windows click-through
 # workaround; already in the tree via eframe on every platform.
 [target.'cfg(target_os = "windows")'.dependencies]
 winit = { version = "0.30", default-features = false }
+
+[features]
+# Renders the GUI to PNGs for visual checks without a display:
+#   cargo test --features preview-render write_previews -- --nocapture
+# The renderer (wgpu, software Vulkan) stays out of normal builds and CI.
+preview-render = ["dep:egui_kittest"]
 
 [profile.release]
 lto = "thin"

@@ -26,6 +26,7 @@ pub struct EditorApp {
 impl EditorApp {
     pub fn new(cc: &CreationContext<'_>) -> Self {
         cc.egui_ctx.set_visuals(eframe::egui::Visuals::dark());
+        crate::widgets::apply_style(&cc.egui_ctx);
         let (settings, path, err) = config::load();
         let status = match err {
             Some(err) => format!("config {path:?}: {err}; defaults loaded"),
@@ -99,90 +100,95 @@ fn shape_name(shape: Shape) -> &'static str {
 
 impl App for EditorApp {
     fn ui(&mut self, ui: &mut eframe::egui::Ui, _frame: &mut EframeFrame) {
-        Panel::left("controls").resizable(false).show(ui, |ui| {
-            rainbow_title(ui, "vibehair");
-            ui.separator();
-            Grid::new("settings")
-                .num_columns(2)
-                .spacing([8.0, 6.0])
-                .show(ui, |ui| {
-                    ui.label("shape");
-                    ComboBox::from_id_salt("shape")
-                        .selected_text(shape_name(self.settings.shape))
-                        .show_ui(ui, |ui| {
-                            for shape in [Shape::Cross, Shape::Dot, Shape::Circle, Shape::T] {
-                                ui.selectable_value(
-                                    &mut self.settings.shape,
-                                    shape,
-                                    shape_name(shape),
-                                );
-                            }
-                        });
-                    ui.end_row();
-                    ui.label("size");
-                    ui.add(
-                        DragValue::new(&mut self.settings.size)
-                            .range(MIN_SIZE..=MAX_SIZE)
-                            .speed(0.5),
-                    );
-                    ui.end_row();
-                    ui.label("gap");
-                    ui.add(
-                        DragValue::new(&mut self.settings.gap)
-                            .range(MIN_GAP..=MAX_GAP)
-                            .speed(0.5),
-                    );
-                    ui.end_row();
-                    ui.label("thickness");
-                    ui.add(
-                        DragValue::new(&mut self.settings.thickness)
-                            .range(MIN_THICKNESS..=MAX_THICKNESS)
-                            .speed(0.1),
-                    );
-                    ui.end_row();
-                    ui.label("opacity");
-                    ui.add(
-                        DragValue::new(&mut self.settings.opacity)
-                            .range(MIN_OPACITY..=MAX_OPACITY)
-                            .speed(0.01),
-                    );
-                    ui.end_row();
-                    ui.label("color");
-                    if ui.text_edit_singleline(&mut self.color_text).changed()
-                        && let Some(color) = config::parse_hex_color(self.color_text.trim())
-                    {
-                        self.settings.color = color;
-                    }
-                    ui.end_row();
-                    ui.label("offset x");
-                    ui.add(
-                        DragValue::new(&mut self.settings.offset_x).range(-MAX_OFFSET..=MAX_OFFSET),
-                    );
-                    ui.end_row();
-                    ui.label("offset y");
-                    ui.add(
-                        DragValue::new(&mut self.settings.offset_y).range(-MAX_OFFSET..=MAX_OFFSET),
-                    );
-                    ui.end_row();
-                });
-            ui.separator();
-            if ui.button("save").clicked() {
-                self.save();
-            }
-            if ui.button("launch overlay").clicked() {
-                self.save();
-                self.restart_overlay();
-            }
-            if ui.button("stop overlay").clicked() {
-                self.kill_overlay();
-                match platform::request_overlay_stop() {
-                    Ok(()) => self.status = "overlay stop requested".to_owned(),
-                    Err(err) => self.status = format!("cannot request stop: {err}"),
+        Panel::left("controls")
+            .resizable(false)
+            .exact_size(260.0)
+            .show(ui, |ui| {
+                rainbow_title(ui, "vibehair");
+                ui.separator();
+                Grid::new("settings")
+                    .num_columns(2)
+                    .spacing([8.0, 6.0])
+                    .show(ui, |ui| {
+                        ui.label("shape");
+                        ComboBox::from_id_salt("shape")
+                            .selected_text(shape_name(self.settings.shape))
+                            .show_ui(ui, |ui| {
+                                for shape in [Shape::Cross, Shape::Dot, Shape::Circle, Shape::T] {
+                                    ui.selectable_value(
+                                        &mut self.settings.shape,
+                                        shape,
+                                        shape_name(shape),
+                                    );
+                                }
+                            });
+                        ui.end_row();
+                        ui.label("size");
+                        ui.add(
+                            DragValue::new(&mut self.settings.size)
+                                .range(MIN_SIZE..=MAX_SIZE)
+                                .speed(0.5),
+                        );
+                        ui.end_row();
+                        ui.label("gap");
+                        ui.add(
+                            DragValue::new(&mut self.settings.gap)
+                                .range(MIN_GAP..=MAX_GAP)
+                                .speed(0.5),
+                        );
+                        ui.end_row();
+                        ui.label("thickness");
+                        ui.add(
+                            DragValue::new(&mut self.settings.thickness)
+                                .range(MIN_THICKNESS..=MAX_THICKNESS)
+                                .speed(0.1),
+                        );
+                        ui.end_row();
+                        ui.label("opacity");
+                        ui.add(
+                            DragValue::new(&mut self.settings.opacity)
+                                .range(MIN_OPACITY..=MAX_OPACITY)
+                                .speed(0.01),
+                        );
+                        ui.end_row();
+                        ui.label("color");
+                        if ui.text_edit_singleline(&mut self.color_text).changed()
+                            && let Some(color) = config::parse_hex_color(self.color_text.trim())
+                        {
+                            self.settings.color = color;
+                        }
+                        ui.end_row();
+                        ui.label("offset x");
+                        ui.add(
+                            DragValue::new(&mut self.settings.offset_x)
+                                .range(-MAX_OFFSET..=MAX_OFFSET),
+                        );
+                        ui.end_row();
+                        ui.label("offset y");
+                        ui.add(
+                            DragValue::new(&mut self.settings.offset_y)
+                                .range(-MAX_OFFSET..=MAX_OFFSET),
+                        );
+                        ui.end_row();
+                    });
+                ui.separator();
+                if ui.button("save").clicked() {
+                    self.save();
                 }
-            }
-            ui.separator();
-            ui.small(&self.status);
-        });
+                if ui.button("launch overlay").clicked() {
+                    self.save();
+                    self.restart_overlay();
+                }
+                if ui.button("stop overlay").clicked() {
+                    self.kill_overlay();
+                    match platform::request_overlay_stop() {
+                        Ok(()) => self.status = "overlay stop requested".to_owned(),
+                        Err(err) => self.status = format!("cannot request stop: {err}"),
+                    }
+                }
+                ui.separator();
+                ui.small(&self.status);
+            });
         CentralPanel::default().show(ui, |ui| {
             ui.heading("preview");
             Frame::canvas(ui.style()).show(ui, |ui| {
@@ -215,8 +221,8 @@ pub fn run() -> eframe::Result {
         NativeOptions {
             viewport: egui::ViewportBuilder::default()
                 .with_title("vibehair")
-                .with_inner_size([560.0, 420.0])
-                .with_min_inner_size([420.0, 320.0]),
+                .with_inner_size([680.0, 520.0])
+                .with_min_inner_size([520.0, 400.0]),
             ..Default::default()
         },
         Box::new(|cc| Ok(Box::new(EditorApp::new(cc)))),

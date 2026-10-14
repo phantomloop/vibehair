@@ -53,6 +53,15 @@
   control panel (start/stop) and kills the overlay it started on exit; the editor has a stop button.
 - The `vibehair` wordmark is an animated rainbow (`widgets::rainbow_title`): hue varies along X and
   advances with time. Only the launcher/editor pay for the animation repaints; the overlay does not.
+- Visual checks without a display: `cargo test --features preview-render write_previews -- --nocapture`
+  renders the launcher states and the editor to `target/test-scratch/preview-*.png` (wgpu; on this
+  server set `VK_ICD_FILENAMES` to a manifest pointing at `libvulkan_lvp.so`). The same feature
+  provides `memory_report`, which drives each window for 2000 frames and prints resident memory
+  growth per window plus egui's galley-cache size - run it *alone*, since a wgpu renderer in the
+  same process allocates enough to look like a leak.
+- The wordmark lays out each glyph once and caches the galleys in egui temp data; per-frame it only
+  paints them with fresh colours, and it stops requesting repaints when the window loses focus.
+  Do not call `fonts_mut` inside `data_mut`: both take the context write lock and deadlock.
 - Diagnostics: `platform::log_line` writes `vibehair.log` next to the settings file, because a
   `windows_subsystem = "windows"` process has no visible stderr.
 - Windows release builds link the CRT statically (`.cargo/config.toml`); `release.yml` fails if

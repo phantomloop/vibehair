@@ -124,6 +124,9 @@ fn configure_window(frame: &mut EframeFrame, settings: &Settings) -> bool {
 /// call per second wins that race and costs a fraction of one egui pass.
 const WATCHDOG_INTERVAL: Duration = Duration::from_secs(1);
 
+/// How many "styles were reset" lines are written before the log goes quiet.
+const MAX_LOGGED_STYLE_REPAIRS: u8 = 3;
+
 /// Window side in physical pixels for these settings.
 fn desired_side_px(settings: &Settings) -> u32 {
     window_size_px(
@@ -208,6 +211,9 @@ pub struct OverlayApp {
     /// Platform window setup attempts so far (a style change needs a frame
     /// change, so the first attempt may not stick; one retry is allowed).
     configure_attempts: u8,
+    /// How often the watchdog had to repair our window styles. A foreign window
+    /// can reset them repeatedly, so only the first few repairs are logged.
+    style_repairs: u8,
     /// When the next topmost/style watchdog tick is due.
     next_watchdog: Instant,
     /// Monitor (physical pixels) the crosshair is placed on: the one showing the
@@ -231,6 +237,7 @@ impl OverlayApp {
             monitor_wait: 8,
             _lock: lock,
             configure_attempts: 0,
+            style_repairs: 0,
             next_watchdog: Instant::now(),
             target_monitor: None,
         }
@@ -256,7 +263,8 @@ impl App for OverlayApp {
                 ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
             }
             if let Some(repair) = enforce_overlay(frame, &self.settings) {
-                if repair {
+                if repair && self.style_repairs < MAX_LOGGED_STYLE_REPAIRS {
+                    self.style_repairs += 1;
                     crate::platform::log_line(
                         "vibehair: overlay styles were reset by another window; repaired",
                     );

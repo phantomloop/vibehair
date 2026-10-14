@@ -51,7 +51,8 @@ pub struct LauncherApp {
 const RUNNING_PROBE_INTERVAL: Duration = Duration::from_millis(500);
 
 impl LauncherApp {
-    pub fn new(_cc: &CreationContext<'_>) -> Self {
+    pub fn new(cc: &CreationContext<'_>) -> Self {
+        crate::widgets::apply_style(&cc.egui_ctx);
         Self {
             overlay: None,
             status: String::new(),
@@ -105,43 +106,87 @@ impl LauncherApp {
     }
 }
 
+/// What the user asked for from the panel.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Action {
+    /// Nothing clicked this frame.
+    None,
+    OpenEditor,
+    StartOverlay,
+    StopOverlay,
+}
+
+/// The launcher's contents. Shared with the head-less preview so the images
+/// show exactly what the application draws.
+pub fn panel(ui: &mut egui::Ui, running: bool, status: &str, error: Option<&str>) -> Action {
+    let mut action = Action::None;
+    /// Buttons share one width so the panel looks deliberate, not ragged.
+    const BUTTON_WIDTH: f32 = 210.0;
+    const BUTTON_HEIGHT: f32 = 38.0;
+
+    CentralPanel::default().show(ui, |ui| {
+        ui.vertical_centered(|ui| {
+            // Push the block towards the middle of the (fixed size) window.
+            ui.add_space(ui.available_height() * 0.18);
+            rainbow_title(ui, "vibehair");
+            ui.add_space(22.0);
+
+            let button = |ui: &mut egui::Ui, label: &str| {
+                ui.add_sized([BUTTON_WIDTH, BUTTON_HEIGHT], egui::Button::new(label))
+                    .clicked()
+            };
+            if button(ui, "open editor") {
+                action = Action::OpenEditor;
+            }
+            ui.add_space(8.0);
+            if running {
+                if button(ui, "stop overlay") {
+                    action = Action::StopOverlay;
+                }
+            } else if button(ui, "launch overlay") {
+                action = Action::StartOverlay;
+            }
+
+            ui.add_space(18.0);
+            let state = if running {
+                "overlay: running"
+            } else {
+                "overlay: stopped"
+            };
+            ui.colored_label(
+                if running {
+                    egui::Color32::from_rgb(120, 220, 120)
+                } else {
+                    egui::Color32::from_gray(160)
+                },
+                egui::RichText::new(state).size(19.0),
+            );
+            if !status.is_empty() {
+                ui.small(status);
+            }
+            if let Some(err) = error {
+                ui.colored_label(egui::Color32::from_rgb(220, 90, 90), err);
+            }
+        });
+    });
+    action
+}
+
 impl App for LauncherApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut EframeFrame) {
-        CentralPanel::default().show(ui, |ui| {
-            ui.vertical_centered(|ui| {
-                rainbow_title(ui, "vibehair");
-                ui.add_space(10.0);
-
-                let running = self.overlay_running();
-                if ui.button("open editor").clicked() {
-                    let mut none = None;
-                    if let Err(err) = spawn_self(crate::state::Mode::Editor, &mut none) {
-                        self.error = Some(err);
-                    }
+        let running = self.overlay_running();
+        let action = panel(ui, running, &self.status, self.error.as_deref());
+        match action {
+            Action::None => {}
+            Action::OpenEditor => {
+                let mut none = None;
+                if let Err(err) = spawn_self(crate::state::Mode::Editor, &mut none) {
+                    self.error = Some(err);
                 }
-                if running {
-                    if ui.button("stop overlay").clicked() {
-                        self.stop_overlay();
-                    }
-                } else if ui.button("launch overlay").clicked() {
-                    self.start_overlay();
-                }
-
-                ui.add_space(6.0);
-                let state = if running {
-                    "overlay: running"
-                } else {
-                    "overlay: stopped"
-                };
-                ui.small(state);
-                if !self.status.is_empty() {
-                    ui.small(&self.status);
-                }
-                if let Some(err) = &self.error {
-                    ui.colored_label(egui::Color32::from_rgb(220, 90, 90), err);
-                }
-            });
-        });
+            }
+            Action::StartOverlay => self.start_overlay(),
+            Action::StopOverlay => self.stop_overlay(),
+        }
     }
 
     /// Closing this window also stops the overlay it started.
@@ -159,7 +204,7 @@ pub fn run() -> eframe::Result {
         NativeOptions {
             viewport: egui::ViewportBuilder::default()
                 .with_title("vibehair")
-                .with_inner_size([280.0, 220.0])
+                .with_inner_size([340.0, 300.0])
                 .with_resizable(false),
             ..Default::default()
         },
