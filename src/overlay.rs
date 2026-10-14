@@ -1,15 +1,16 @@
 //! Transparent, click-through overlay window.
 //!
-//! A small viewport sized to the crosshair, centered on the primary monitor
-//! plus the manual offsets. Event-driven: repaints only on config/resize
-//! changes or when the OS asks (first frames, DPI change). No idle loop.
+//! A small viewport sized to the crosshair, centered on the monitor plus the
+//! manual offsets. Event-driven: viewport commands are sent only when the
+//! desired geometry actually changes, and repaint requests are bounded.
 //!
 //! Platform notes: transparency, topmost, undecorated and mouse-passthrough
 //! are requested through eframe/winit viewport flags, which is the documented
-//! path on Windows. Actual on-screen/Hunt behavior is unverified (no Windows
-//! machine here) and is marked so in the release checklist.
+//! path on Windows. Actual on-screen behavior in Hunt: Showdown is unverified
+//! (no Windows game machine here) and is marked so in the release checklist.
 
-use std::time::Duration;
+use std::fs::{File, OpenOptions, TryLockError};
+use std::path::{Path, PathBuf};
 
 use eframe::egui::{CentralPanel, Frame};
 use eframe::{App, CreationContext, Frame as EframeFrame, NativeOptions};
@@ -32,30 +33,99 @@ pub fn viewport_builder() -> egui::ViewportBuilder {
         .with_active(false)
 }
 
+/// Window side in physical pixels for these settings.
+fn desired_side_px(settings: &Settings) -> u32 {
+    window_size_px(
+        settings.shape,
+        settings.size,
+        settings.gap,
+        settings.thickness,
+    )
+    .0
+}
+
+/// Outer top-left position in logical points.
+///
+/// `monitor_points` is `ViewportInfo::monitor_size`, which egui reports in
+/// logical points; it is converted to physical pixels here so the centering
+/// math and the DPI division cancel out exactly once.
+fn desired_outer_points(
+    settings: &Settings,
+    side_px: u32,
+    monitor_points: egui::Vec2,
+    pixels_per_point: f32,
+) -> (f32, f32) {
+    window_outer_pos_points(
+        (
+            monitor_points.x * pixels_per_point,
+            monitor_points.y * pixels_per_point,
+        ),
+        (side_px as f32, side_px as f32),
+        (settings.offset_x, settings.offset_y),
+        pixels_per_point,
+    )
+}
+
+/// Geometry the window has been told to use, to avoid resending commands.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+struct Applied {
+    side_px: u32,
+    pixels_per_point: f32,
+    pos: Option<(f32, f32)>,
+}
+
+/// Lock file path guarding against multiple simultaneous overlays.
+pub fn overlay_lock_path() -> PathBuf {
+    config::resolve_save_path().with_file_name("overlay.lock")
+}
+
+/// Exclusive, non-blocking lock on `path`.
+///
+/// `Ok(None)` means another overlay process holds the lock. Errors that are
+/// not contention (e.g. unsupported filesystem) allow running rather than
+/// silently disabling the overlay.
+fn try_lock_file(path: &Path) -> std::io::Result<Option<File>> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let file = OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(path)?;
+    match file.try_lock() {
+        Ok(()) => Ok(Some(file)),
+        Err(TryLockError::WouldBlock) => Ok(None),
+        Err(TryLockError::Error(err)) => Err(err),
+    }
+}
+
 pub struct OverlayApp {
     settings: Settings,
-    /// Window side in physical pixels, to detect resize needs.
-    window_px: u32,
-    /// Last sent outer position in points; resend only on change.
-    last_pos: Option<(f32, f32)>,
-    /// Frames left that must still repaint unconditionally (startup/DPI settle).
+    applied: Applied,
+    /// Frames still to repaint after a resize so the new size takes effect.
     settle_frames: u8,
+    /// Bounded frames waiting for the OS to report the monitor size.
+    monitor_wait: u8,
+    /// Holds the single-instance lock for the process lifetime, when available.
+    _lock: Option<File>,
 }
 
 impl OverlayApp {
-    pub fn new(_cc: &CreationContext<'_>) -> Self {
+    pub fn new(_cc: &CreationContext<'_>, lock: Option<File>) -> Self {
         let (settings, path, err) = config::load();
         if let Some(err) = err {
             eprintln!("vibehair: config {path:?}: {err}; using defaults");
         }
-        // NOTE: no InnerSize here: `pixels_per_point` is still the default 1.0
-        // before the first update. The first `ui()` passes send it with the
-        // real scale while `settle_frames` runs (`window_px: 0` forces resend).
+        // No viewport commands here: `pixels_per_point` is still its default
+        // 1.0 before the first update. The first `ui()` pass applies the real
+        // size (`applied` starts at zero, so it always differs).
         Self {
             settings,
-            window_px: 0,
-            last_pos: None,
-            settle_frames: 3,
+            applied: Applied::default(),
+            settle_frames: 0,
+            monitor_wait: 8,
+            _lock: lock,
         }
     }
 }
@@ -64,46 +134,51 @@ impl App for OverlayApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut EframeFrame) {
         let ctx = ui.ctx().clone();
         let ppp = ctx.pixels_per_point().max(0.5);
-        let (side, _) = window_size_px(
-            self.settings.shape,
-            self.settings.size,
-            self.settings.gap,
-            self.settings.thickness,
-        );
-        if side != self.window_px || self.settle_frames > 0 {
-            self.window_px = side;
+        let side = desired_side_px(&self.settings);
+
+        let scale_changed = (self.applied.pixels_per_point - ppp).abs() > 0.01;
+        if side != self.applied.side_px || scale_changed {
+            self.applied.side_px = side;
+            self.applied.pixels_per_point = ppp;
             ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(egui::vec2(
                 side as f32 / ppp,
                 side as f32 / ppp,
             )));
-            self.settle_frames = self.settle_frames.max(2);
+            self.settle_frames = 2; // REGRESSION-PROBE
         }
-        // Re-center (cheap, idempotent): handles monitor/DPI/offset changes.
-        // `monitor_size` is in egui points; convert to physical px for the helper.
+
         let monitor = ctx
             .input(|i| i.viewport().monitor_size)
-            .unwrap_or(egui::vec2(0.0, 0.0));
+            .unwrap_or(egui::Vec2::ZERO);
         if monitor.x > 1.0 && monitor.y > 1.0 {
-            let (x, y) = window_outer_pos_points(
-                (monitor.x * ppp, monitor.y * ppp),
-                (side as f32, side as f32),
-                (self.settings.offset_x, self.settings.offset_y),
-                ppp,
-            );
-            if self.last_pos != Some((x, y)) {
-                self.last_pos = Some((x, y));
-                ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(egui::pos2(x, y)));
+            let want = desired_outer_points(&self.settings, side, monitor, ppp);
+            if self.applied.pos != Some(want) {
+                self.applied.pos = Some(want);
+                ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(egui::pos2(
+                    want.0, want.1,
+                )));
             }
+        } else if self.monitor_wait > 0 {
+            // The OS reports the monitor size a frame or two in; retry briefly.
+            self.monitor_wait -= 1;
+            ctx.request_repaint();
         }
+
         if self.settle_frames > 0 {
             self.settle_frames -= 1;
-            ctx.request_repaint_after(Duration::from_millis(100));
+            ctx.request_repaint();
         }
 
         CentralPanel::default().frame(Frame::NONE).show(ui, |ui| {
             let center = ui.max_rect().center();
             paint_crosshair(ui.painter(), center, &self.settings);
         });
+    }
+
+    /// Transparent background: the crosshair must be the only visible content.
+    /// eframe's default (rgba 12,12,12,180) would paint a visible dark box.
+    fn clear_color(&self, _visuals: &egui::Visuals) -> [f32; 4] {
+        [0.0, 0.0, 0.0, 0.0]
     }
 }
 
@@ -116,16 +191,44 @@ pub fn native_options() -> NativeOptions {
 }
 
 pub fn run() -> eframe::Result {
+    let lock = match acquire_overlay_lock() {
+        Ok(Some(lock)) => Some(lock),
+        Ok(None) => {
+            eprintln!("vibehair: an overlay is already running");
+            return Ok(());
+        }
+        Err(err) => {
+            // A broken/unsupported lock file must not disable the overlay.
+            eprintln!("vibehair: {err}; continuing without single-instance guard");
+            None
+        }
+    };
     eframe::run_native(
         "vibehair overlay",
         native_options(),
-        Box::new(|cc| Ok(Box::new(OverlayApp::new(cc)))),
+        Box::new(move |cc| Ok(Box::new(OverlayApp::new(cc, lock)))),
     )
+}
+
+/// `Ok(None)` when another overlay process already holds the lock.
+fn acquire_overlay_lock() -> Result<Option<File>, String> {
+    let path = overlay_lock_path();
+    try_lock_file(&path).map_err(|err| format!("cannot use lock file {path:?}: {err}"))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
+
+    fn scratch(name: &str) -> PathBuf {
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("target")
+            .join("test-scratch")
+            .join(format!("{name}-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        dir
+    }
 
     #[test]
     fn overlay_requests_transparent_click_through_topmost() {
@@ -142,5 +245,135 @@ mod tests {
         let vb = viewport_builder();
         assert_eq!(vb.taskbar, Some(false));
         assert_eq!(vb.active, Some(false));
+        assert_eq!(vb.has_shadow, Some(false));
+    }
+
+    #[test]
+    fn overlay_background_is_fully_transparent() {
+        let lock = try_lock_file(&scratch("clear").join("a.lock"))
+            .unwrap()
+            .unwrap();
+        let cc = CreationContext::_new_kittest(egui::Context::default());
+        let app = OverlayApp::new(&cc, Some(lock));
+        assert_eq!(
+            app.clear_color(&egui::Visuals::dark()),
+            [0.0, 0.0, 0.0, 0.0]
+        );
+    }
+
+    #[test]
+    fn lock_excludes_second_holder_and_releases_on_drop() {
+        let path = scratch("lock").join("overlay.lock");
+        let first = try_lock_file(&path).unwrap().expect("first lock");
+        assert!(
+            try_lock_file(&path).unwrap().is_none(),
+            "second lock must fail"
+        );
+        drop(first);
+        assert!(
+            try_lock_file(&path).unwrap().is_some(),
+            "lock must be reusable"
+        );
+    }
+
+    #[test]
+    fn centering_is_correct_in_physical_pixels_at_200_percent_dpi() {
+        let s = Settings {
+            size: 48.0,
+            gap: 0.0,
+            thickness: 0.0,
+            ..Settings::default()
+        };
+        let side = desired_side_px(&s);
+        let side_f = side as f32;
+        // Same monitor, reported as 1920x1080 points at 200% => 3840x2160 physical px.
+        let (x, y) = desired_outer_points(&s, side, egui::vec2(1920.0, 1080.0), 2.0);
+        // Points must be the physical center divided by the scale factor.
+        assert_eq!(x, (3840.0 - side_f) / 4.0);
+        assert_eq!(y, (2160.0 - side_f) / 4.0);
+        // A points-vs-physical mix-up (the earlier bug) would produce these:
+        assert_ne!(x, (1920.0 - side_f) / 4.0);
+    }
+
+    #[test]
+    fn offsets_shift_position_by_physical_pixels() {
+        let s = Settings {
+            offset_x: 10,
+            offset_y: -20,
+            ..Settings::default()
+        };
+        let side = desired_side_px(&s);
+        let side_f = side as f32;
+        let (x, y) = desired_outer_points(&s, side, egui::vec2(1920.0, 1080.0), 1.0);
+        assert_eq!(x, (1920.0 - side_f) / 2.0 + 10.0);
+        assert_eq!(y, (1080.0 - side_f) / 2.0 - 20.0);
+        // At 200% the same physical offsets are half as many logical points
+        // (3840x2160 physical monitor).
+        let (x2, y2) = desired_outer_points(&s, side, egui::vec2(1920.0, 1080.0), 2.0);
+        assert_eq!(x2, (3840.0 - side_f) / 4.0 + 5.0);
+        assert_eq!(y2, (2160.0 - side_f) / 4.0 - 10.0);
+    }
+
+    #[test]
+    fn applied_defaults_force_first_frame_apply() {
+        let applied = Applied::default();
+        let s = Settings::default();
+        assert_ne!(applied.side_px, desired_side_px(&s));
+        assert_eq!(applied.pos, None);
+    }
+
+    /// Drive one headless egui pass; returns the viewport commands and the
+    /// repaint delay the app requested.
+    fn run_pass(
+        ctx: &egui::Context,
+        app: &mut OverlayApp,
+    ) -> (Vec<egui::ViewportCommand>, std::time::Duration) {
+        let mut frame = EframeFrame::_new_kittest();
+        let mut output = ctx.run_ui(egui::RawInput::default(), |ui| {
+            app.ui(ui, &mut frame);
+        });
+        output.textures_delta.clear(); // headless: nothing renders the textures
+        match output.viewport_output.get(&egui::ViewportId::ROOT) {
+            Some(out) => (out.commands.clone(), out.repaint_delay),
+            None => (Vec::new(), std::time::Duration::MAX),
+        }
+    }
+
+    /// Regression test for the overlay burning CPU: the window size used to be
+    /// re-applied on every frame, which kept triggering resize events forever.
+    #[test]
+    fn steady_state_applies_size_once_and_stops_repainting() {
+        let ctx = egui::Context::default();
+        let lock = try_lock_file(&scratch("steady").join("a.lock")).unwrap();
+        let cc = CreationContext::_new_kittest(ctx.clone());
+        let mut app = OverlayApp::new(&cc, lock);
+
+        let mut size_sends = 0;
+        let mut repaint_requests = 0;
+        let mut last_delay = Duration::ZERO;
+        for _ in 0..16 {
+            let (commands, delay) = run_pass(&ctx, &mut app);
+            size_sends += commands
+                .iter()
+                .filter(|cmd| matches!(cmd, egui::ViewportCommand::InnerSize(_)))
+                .count();
+            if delay < Duration::MAX {
+                repaint_requests += 1;
+            }
+            last_delay = delay;
+        }
+        assert_eq!(
+            size_sends, 1,
+            "window size must be applied once, not every frame"
+        );
+        assert!(
+            repaint_requests <= 12,
+            "repaint requests must be bounded during startup, got {repaint_requests}"
+        );
+        assert_eq!(
+            last_delay,
+            Duration::MAX,
+            "overlay must idle without repainting"
+        );
     }
 }

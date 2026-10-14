@@ -1,5 +1,7 @@
 //! Minimal dark editor: controls + live preview, same renderer as overlay.
 
+use std::process::Child;
+
 use eframe::egui::{CentralPanel, Color32, ComboBox, DragValue, Frame, Grid, Panel};
 use eframe::{App, CreationContext, Frame as EframeFrame, NativeOptions};
 
@@ -8,12 +10,16 @@ use crate::config::{
     MIN_SIZE, MIN_THICKNESS, Settings,
 };
 use crate::geometry::Shape;
+use crate::platform;
 use crate::render::paint_crosshair;
 
 pub struct EditorApp {
     settings: Settings,
     status: String,
     color_text: String,
+    /// The overlay process started from here, if any. Killed when the editor
+    /// closes or restarts the overlay, so closing the app closes the overlay.
+    overlay: Option<Child>,
 }
 
 impl EditorApp {
@@ -29,6 +35,7 @@ impl EditorApp {
             settings,
             status,
             color_text,
+            overlay: None,
         }
     }
 
@@ -39,6 +46,35 @@ impl EditorApp {
             Err(err) => self.status = format!("save failed: {err}"),
         }
     }
+
+    /// Start an overlay, replacing any overlay this editor started before.
+    fn restart_overlay(&mut self) {
+        self.kill_overlay();
+        match launch_overlay_child() {
+            Ok(child) => {
+                self.overlay = Some(child);
+                self.status = "overlay launched".to_owned();
+            }
+            Err(err) => self.status = err,
+        }
+    }
+
+    /// Stop the overlay process this editor started, if it is still running.
+    fn kill_overlay(&mut self) {
+        if let Some(mut child) = self.overlay.take() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
+}
+
+fn launch_overlay_child() -> Result<Child, String> {
+    let exe = std::env::current_exe().map_err(|err| format!("cannot locate own exe: {err}"))?;
+    let mut cmd = std::process::Command::new(exe);
+    cmd.arg("--overlay");
+    platform::hide_console(&mut cmd);
+    cmd.spawn()
+        .map_err(|err| format!("launch overlay failed: {err}"))
 }
 
 fn hex_of(color: [u8; 3]) -> String {
@@ -128,9 +164,7 @@ impl App for EditorApp {
             }
             if ui.button("launch overlay").clicked() {
                 self.save();
-                if let Some(err) = spawn_overlay() {
-                    self.status = err;
-                }
+                self.restart_overlay();
             }
             ui.separator();
             ui.small(&self.status);
@@ -147,16 +181,10 @@ impl App for EditorApp {
             });
         });
     }
-}
 
-/// Relaunch this exe in overlay mode; `Some(message)` on failure for the UI status line.
-fn spawn_overlay() -> Option<String> {
-    match std::env::current_exe() {
-        Ok(exe) => match std::process::Command::new(exe).arg("--overlay").spawn() {
-            Ok(_) => None,
-            Err(err) => Some(format!("launch overlay failed: {err}")),
-        },
-        Err(err) => Some(format!("cannot locate own exe: {err}")),
+    /// Closing the editor also closes an overlay started from it.
+    fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+        self.kill_overlay();
     }
 }
 

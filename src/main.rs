@@ -1,3 +1,6 @@
+// Hide the console window on Windows: vibehair is a GUI app, not a CLI tool.
+#![cfg_attr(target_os = "windows", windows_subsystem = "windows")]
+
 mod config;
 mod editor;
 mod geometry;
