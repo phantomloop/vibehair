@@ -97,6 +97,54 @@ unsafe extern "system" {
     fn DwmSetWindowAttribute(hwnd: isize, attribute: u32, value: *const u32, size: u32) -> i32;
 }
 
+/// Win32 `PROCESS_MEMORY_COUNTERS`; only `working_set_size` is read here.
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct ProcessMemoryCounters {
+    cb: u32,
+    page_fault_count: u32,
+    peak_working_set_size: usize,
+    working_set_size: usize,
+    quota_peak_paged_pool_usage: usize,
+    quota_paged_pool_usage: usize,
+    quota_peak_non_paged_pool_usage: usize,
+    quota_non_paged_pool_usage: usize,
+    pagefile_usage: usize,
+    peak_pagefile_usage: usize,
+}
+
+#[link(name = "kernel32")]
+unsafe extern "system" {
+    fn GetCurrentProcess() -> isize;
+    fn K32GetProcessMemoryInfo(
+        process: isize,
+        counters: *mut ProcessMemoryCounters,
+        cb: u32,
+    ) -> i32;
+}
+
+/// Resident working set of the current process, in bytes.
+///
+/// The query goes through `K32GetProcessMemoryInfo`, the kernel32 forwarder to
+/// the psapi entry point, so the psapi DLL does not have to be loaded by name.
+/// A failure is reported as `None` rather than panicking: the log line is
+/// diagnostics, not a control path.
+pub fn working_set_bytes() -> Option<u64> {
+    // Safety: only queries our own process; `counters` is a valid out-parameter
+    // and `cb` matches the struct the callee fills in.
+    unsafe {
+        let mut counters = ProcessMemoryCounters {
+            cb: size_of::<ProcessMemoryCounters>() as u32,
+            ..Default::default()
+        };
+        let process = GetCurrentProcess();
+        if K32GetProcessMemoryInfo(process, &mut counters, counters.cb) == 0 {
+            return None;
+        }
+        Some(counters.working_set_size as u64)
+    }
+}
+
 /// Extended style for the overlay: click-through, hidden from the taskbar,
 /// never activated, plus `WS_EX_LAYERED` in key mode only.
 ///

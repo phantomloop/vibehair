@@ -68,7 +68,13 @@ impl Transparency {
 }
 
 /// All user-adjustable crosshair settings. Field names are the TOML keys.
+///
+/// `default` here means a *missing* key keeps its default while every other key
+/// in the file is still read: a hand-edited file that lost a line - or one
+/// written by an older version - degrades per field instead of being discarded
+/// whole.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
 pub struct Settings {
     pub shape: Shape,
     /// Arm length (cross/T) or radius (circle/dot), in physical pixels.
@@ -93,6 +99,11 @@ pub struct Settings {
     pub offset_x: i32,
     /// Manual Y offset from screen center, in physical pixels (down is positive).
     pub offset_y: i32,
+    /// Close the launcher/editor window as soon as it has started the overlay,
+    /// so only the overlay process stays resident. Off by default: keeping the
+    /// window open is what lets the menu stop the overlay.
+    #[serde(default)]
+    pub close_after_launch: bool,
 }
 
 fn default_color() -> [u8; 3] {
@@ -133,6 +144,7 @@ impl Default for Settings {
             transparency: Transparency::default(),
             offset_x: 0,
             offset_y: 0,
+            close_after_launch: false,
         }
     }
 }
@@ -301,10 +313,50 @@ mod tests {
             transparency: Transparency::Alpha,
             offset_x: -40,
             offset_y: 120,
+            close_after_launch: true,
         };
         let text = toml::to_string(&s).unwrap();
+        assert!(text.contains("close_after_launch = true"), "{text}");
         let back: Settings = toml::from_str(&text).unwrap();
         assert_eq!(back, s);
+    }
+
+    /// A file written before `close_after_launch` existed, and one that lost a
+    /// line to hand editing, must keep every value they do contain.
+    #[test]
+    fn missing_keys_keep_their_defaults_and_the_rest_survives() {
+        let dir = scratch("old-file");
+        let file = dir.join("old.toml");
+        // No `gap`, no `close_after_launch`: both must fall back, the rest stays.
+        std::fs::write(
+            &file,
+            "shape = \"circle\"\nsize = 21.5\ntransparency = \"alpha\"\noffset_y = -12\n",
+        )
+        .unwrap();
+        let (settings, err) = load_from(&file);
+        assert!(err.is_none(), "{err:?}");
+        assert_eq!(settings.shape, Shape::Circle);
+        assert_eq!(settings.size, 21.5);
+        assert_eq!(settings.transparency, Transparency::Alpha);
+        assert_eq!(settings.offset_y, -12);
+        assert_eq!(
+            settings.gap,
+            Settings::default().gap,
+            "missing key defaulted"
+        );
+        assert!(!settings.close_after_launch, "new key defaults to off");
+    }
+
+    /// A wrong type is still a hard error for the whole file: silently mixing
+    /// a broken value with defaults would hide the mistake.
+    #[test]
+    fn wrong_type_still_falls_back_to_defaults_with_a_message() {
+        let dir = scratch("wrong-type");
+        let file = dir.join("bad.toml");
+        std::fs::write(&file, "size = \"not a number\"\n").unwrap();
+        let (settings, err) = load_from(&file);
+        assert!(err.is_some(), "a type error must be reported");
+        assert_eq!(settings.size, Settings::default().size);
     }
 
     #[test]

@@ -352,7 +352,13 @@ impl App for OverlayApp {
 /// Native options for the overlay window.
 pub fn native_options(settings: &Settings) -> NativeOptions {
     NativeOptions {
+        // Tiny first size: the real size (crosshair extent + antialiasing
+        // margin) is applied on the first frames, in physical pixels.
         viewport: viewport_builder(settings.transparency).with_inner_size([64.0, 64.0]),
+        // Flat 2D content: no depth, stencil or MSAA buffers.
+        depth_buffer: 0,
+        stencil_buffer: 0,
+        multisampling: 0,
         ..Default::default()
     }
 }

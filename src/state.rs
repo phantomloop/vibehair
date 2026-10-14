@@ -1,4 +1,4 @@
-//! Startup mode selection: launcher, editor, or overlay.
+//! Startup mode selection: launcher, editor, overlay, or a one-shot stop.
 //!
 //! Pure logic, no windows: `cargo test` covers the whole state machine.
 
@@ -14,6 +14,10 @@ pub enum Mode {
     Editor,
     /// Transparent click-through overlay.
     Overlay,
+    /// Ask a running overlay to close and exit; opens no window at all, so it
+    /// also works from a terminal. This is how an overlay started in
+    /// "close after launching" mode is stopped, since no menu is left open.
+    Stop,
 }
 
 /// Parse CLI args (excluding argv[0]). Unknown flags are an error; `--help`/`-h` too.
@@ -25,6 +29,7 @@ pub fn parse_args(args: &[OsString]) -> Result<Mode, String> {
         let flag = match text.as_ref() {
             "--editor" => Some(Mode::Editor),
             "--overlay" => Some(Mode::Overlay),
+            "--stop" => Some(Mode::Stop),
             "--launcher" => Some(Mode::Launcher),
             "--help" | "-h" => return Err(usage()),
             _ => None,
@@ -34,7 +39,9 @@ pub fn parse_args(args: &[OsString]) -> Result<Mode, String> {
                 mode = next;
                 seen = true;
             }
-            Some(_) => return Err("only one of --launcher, --editor, --overlay".to_owned()),
+            Some(_) => {
+                return Err("only one of --launcher, --editor, --overlay, --stop".to_owned());
+            }
             None => return Err(format!("unknown argument: {text}\n{}", usage())),
         }
     }
@@ -42,7 +49,7 @@ pub fn parse_args(args: &[OsString]) -> Result<Mode, String> {
 }
 
 pub fn usage() -> String {
-    "usage: vibehair [--launcher | --editor | --overlay]".to_owned()
+    "usage: vibehair [--launcher | --editor | --overlay | --stop]".to_owned()
 }
 
 #[cfg(test)]
@@ -63,11 +70,13 @@ mod tests {
     fn each_mode_selects_exactly() {
         assert_eq!(parse_args(&args(&["--editor"])), Ok(Mode::Editor));
         assert_eq!(parse_args(&args(&["--overlay"])), Ok(Mode::Overlay));
+        assert_eq!(parse_args(&args(&["--stop"])), Ok(Mode::Stop));
     }
 
     #[test]
     fn conflicting_or_unknown_args_fail() {
         assert!(parse_args(&args(&["--editor", "--overlay"])).is_err());
+        assert!(parse_args(&args(&["--stop", "--overlay"])).is_err());
         assert!(parse_args(&args(&["--bogus"])).is_err());
         assert!(parse_args(&args(&["--help"])).is_err());
     }

@@ -10,10 +10,86 @@
 //! on this project's build server the Vulkan ICD manifest is not installed, so
 //! `VK_ICD_FILENAMES` is pointed at `libvulkan_lvp.so` when running the test.
 
+use std::alloc::{GlobalAlloc, Layout, System};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use eframe::egui;
 use egui_kittest::Harness;
+
+/// Global allocator for the preview build: tracks how much heap the
+/// application itself holds. The rest of the resident set belongs to winit,
+/// glow and the graphics driver, which is why RSS alone is misleading.
+struct CountingAlloc;
+
+/// Bytes allocated by the application and not yet freed.
+static LIVE_BYTES: AtomicUsize = AtomicUsize::new(0);
+/// Largest `LIVE_BYTES` seen since the last `reset_peak`.
+static PEAK_BYTES: AtomicUsize = AtomicUsize::new(0);
+
+#[global_allocator]
+static ALLOC: CountingAlloc = CountingAlloc;
+
+impl CountingAlloc {
+    /// Bytes currently held on the application heap.
+    pub fn live_bytes() -> usize {
+        LIVE_BYTES.load(Ordering::Relaxed)
+    }
+
+    /// Peak live bytes since the last `reset_peak`.
+    pub fn peak_bytes() -> usize {
+        PEAK_BYTES.load(Ordering::Relaxed)
+    }
+
+    /// Forget the peak; the next peak starts from the current live value.
+    pub fn reset_peak() {
+        PEAK_BYTES.store(Self::live_bytes(), Ordering::Relaxed);
+    }
+}
+
+/// Add `size` to the live total and keep the peak up to date.
+fn bump(size: usize) {
+    let live = LIVE_BYTES.fetch_add(size, Ordering::Relaxed) + size;
+    PEAK_BYTES.fetch_max(live, Ordering::Relaxed);
+}
+
+// Safety: forwards to the system allocator; the counters only add bookkeeping
+// and never affect the returned pointers or the layout handed to the system.
+unsafe impl GlobalAlloc for CountingAlloc {
+    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+        // Safety: `layout` comes from the caller of the allocator, as System needs.
+        let ptr = unsafe { System.alloc(layout) };
+        if !ptr.is_null() {
+            bump(layout.size());
+        }
+        ptr
+    }
+
+    unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+        // Safety: `ptr` came from this allocator with the same `layout`.
+        unsafe { System.dealloc(ptr, layout) };
+        LIVE_BYTES.fetch_sub(layout.size(), Ordering::Relaxed);
+    }
+
+    unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
+        // Safety: as in `alloc`.
+        let ptr = unsafe { System.alloc_zeroed(layout) };
+        if !ptr.is_null() {
+            bump(layout.size());
+        }
+        ptr
+    }
+
+    unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
+        // Safety: `ptr` came from this allocator with the same `layout`.
+        let new_ptr = unsafe { System.realloc(ptr, layout, new_size) };
+        if !new_ptr.is_null() {
+            LIVE_BYTES.fetch_sub(layout.size(), Ordering::Relaxed);
+            bump(new_size);
+        }
+        new_ptr
+    }
+}
 
 /// Output directory for the previews (inside the ignored build tree).
 fn out_dir() -> PathBuf {
@@ -45,16 +121,29 @@ mod capture_screens {
         // The launcher at two points in the rainbow animation, plus the state
         // where an overlay is running (so the stop button shows).
         for (name, time) in [("launcher", 0.0_f64), ("launcher-animated", 1.0)] {
-            capture(name, egui::vec2(340.0, 300.0), move |ui| {
+            capture(name, egui::vec2(340.0, 340.0), move |ui| {
                 set_time(ui, time);
-                launcher::panel(ui, false, "ready", None);
+                let mut close_after_launch = false;
+                launcher::panel(ui, false, "ready", None, &mut close_after_launch);
             });
         }
-        capture("launcher-running", egui::vec2(340.0, 300.0), |ui| {
-            launcher::panel(ui, true, "overlay started", None);
+        let mut close_after_launch = false;
+        capture("launcher-running", egui::vec2(340.0, 340.0), move |ui| {
+            launcher::panel(ui, true, "overlay started", None, &mut close_after_launch);
         });
-        capture("launcher-error", egui::vec2(340.0, 300.0), |ui| {
-            launcher::panel(ui, false, "", Some("launch failed: access denied"));
+        let mut close_after_launch = false;
+        capture("launcher-error", egui::vec2(340.0, 340.0), move |ui| {
+            launcher::panel(
+                ui,
+                false,
+                "",
+                Some("launch failed: access denied"),
+                &mut close_after_launch,
+            );
+        });
+        let mut close_after_launch = true;
+        capture("launcher-close-mode", egui::vec2(340.0, 340.0), move |ui| {
+            launcher::panel(ui, false, "", None, &mut close_after_launch);
         });
 
         // The editor is a whole window of controls; check that the wider fonts
@@ -129,14 +218,21 @@ fn memory_report() {
             run_frame(&ctx, &mut frame, &mut app, size, index as f64 / 25.0);
         }
         let start = rss_kib();
+        CountingAlloc::reset_peak();
+        let heap_start = CountingAlloc::live_bytes();
         for index in WARMUP..FRAMES {
             run_frame(&ctx, &mut frame, &mut app, size, index as f64 / 25.0);
         }
+        let heap_end = CountingAlloc::live_bytes();
+        let heap_peak = CountingAlloc::peak_bytes();
         let end = rss_kib();
         let frames = (FRAMES - WARMUP) as u64;
         println!(
-            "{window:>8}: rss {start} -> {end} KiB over {frames} frames ({} bytes/frame), galleys {}",
+            "{window:>8}: rss {start} -> {end} KiB over {frames} frames ({} bytes/frame), heap {} -> {} KiB (peak {} KiB), galleys {}",
             end.saturating_sub(start) * 1024 / frames,
+            heap_start / 1024,
+            heap_end / 1024,
+            heap_peak / 1024,
             ctx.fonts(|fonts| fonts.num_galleys_in_cache())
         );
     }
@@ -158,7 +254,8 @@ fn run_frame(
     let mut output = ctx.run_ui(raw, |ui| match app {
         Some(app) => app.ui(ui, frame),
         None => {
-            crate::launcher::panel(ui, false, "ready", None);
+            let mut close_after_launch = false;
+            crate::launcher::panel(ui, false, "ready", None, &mut close_after_launch);
         }
     });
     output.textures_delta.clear();

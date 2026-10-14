@@ -82,14 +82,45 @@ pub fn take_overlay_stop_request() -> bool {
 
 /// Stop a spawned child from flashing a console window on Windows.
 pub fn hide_console(cmd: &mut std::process::Command) {
+    // Windowed children must not write into the parent's terminal, whatever
+    // platform those streams go to: diagnostics go to the log file instead.
+    cmd.stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
     #[cfg(target_os = "windows")]
     {
         use std::os::windows::process::CommandExt as _;
         const CREATE_NO_WINDOW: u32 = 0x0800_0000;
         cmd.creation_flags(CREATE_NO_WINDOW);
     }
-    #[cfg(not(target_os = "windows"))]
-    let _ = cmd;
+}
+
+/// Resident working set of this process, in bytes, if the OS exposes it.
+///
+/// This is the *whole* resident set, not just the application's heap: on
+/// Windows most of it belongs to winit, glow and the graphics driver, so the
+/// heap the application itself holds is tracked separately (see `preview`).
+/// Reading it is a plain query; it never fails fatally.
+pub fn working_set_bytes() -> Option<u64> {
+    #[cfg(target_os = "linux")]
+    // `/proc/self/status` reports `VmRSS:` in KiB. A missing file or field means
+    // the value is unavailable, which the caller must tolerate.
+    return std::fs::read_to_string("/proc/self/status")
+        .ok()?
+        .lines()
+        .find_map(|line| line.strip_prefix("VmRSS:"))
+        .and_then(|kib| kib.split_whitespace().next()?.parse::<u64>().ok())
+        .and_then(|kib| kib.checked_mul(1024));
+
+    #[cfg(target_os = "windows")]
+    return crate::platform_windows::working_set_bytes();
+
+    #[cfg(not(any(target_os = "linux", target_os = "windows")))]
+    None
+}
+
+/// Resident working set in megabytes, for log lines.
+pub fn working_set_mb() -> Option<f64> {
+    working_set_bytes().map(|bytes| bytes as f64 / (1024.0 * 1024.0))
 }
 
 /// Color the overlay clears to.
@@ -148,6 +179,24 @@ pub fn log_line(msg: &str) {
 
 #[cfg(test)]
 mod tests {
+    /// The parser is thin, but a wrong unit would make every log line lie:
+    /// the resident set of a running test process is megabytes, not kilobytes.
+    #[test]
+    fn working_set_is_reported_in_bytes() {
+        let bytes = working_set_bytes();
+        #[cfg(any(target_os = "linux", target_os = "windows"))]
+        {
+            let bytes = bytes.expect("this platform exposes the resident set");
+            assert!(
+                bytes > 1_000_000 && bytes < 1_000_000_000_000,
+                "implausible resident set: {bytes} bytes"
+            );
+            assert_eq!(working_set_mb().map(|mb| mb > 1.0), Some(true));
+        }
+        #[cfg(not(any(target_os = "linux", target_os = "windows")))]
+        assert!(bytes.is_none());
+    }
+
     use super::*;
 
     #[test]

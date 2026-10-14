@@ -16,6 +16,10 @@ use crate::widgets::rainbow_title;
 
 pub struct EditorApp {
     settings: Settings,
+    /// Set when the overlay was started in "close after launching" mode: the
+    /// window closes itself at the end of the frame (a viewport command cannot
+    /// be sent from inside the small helper that launches the overlay).
+    close_after_launch: bool,
     status: String,
     color_text: String,
     /// The overlay process started from here, if any. Killed when the editor
@@ -35,6 +39,7 @@ impl EditorApp {
         let color_text = hex_of(settings.color);
         Self {
             settings,
+            close_after_launch: false,
             status,
             color_text,
             overlay: None,
@@ -60,8 +65,16 @@ impl EditorApp {
         }
         match launch_overlay_child() {
             Ok(child) => {
-                self.overlay = Some(child);
-                self.status = "overlay launched".to_owned();
+                if self.settings.close_after_launch {
+                    // Dropping the handle leaves the overlay running on its own,
+                    // so this window can close and free its memory.
+                    drop(child);
+                    self.status = "overlay launched; closing".to_owned();
+                    self.close_after_launch = true;
+                } else {
+                    self.overlay = Some(child);
+                    self.status = "overlay launched".to_owned();
+                }
             }
             Err(err) => self.status = err,
         }
@@ -207,6 +220,12 @@ impl App for EditorApp {
                 );
             });
         });
+        if self.close_after_launch {
+            // The overlay is running on its own; this window is now pure overhead.
+            self.close_after_launch = false;
+            ui.ctx()
+                .send_viewport_cmd(eframe::egui::ViewportCommand::Close);
+        }
     }
 
     /// Closing the editor also closes an overlay started from it.
@@ -223,6 +242,10 @@ pub fn run() -> eframe::Result {
                 .with_title("vibehair")
                 .with_inner_size([680.0, 520.0])
                 .with_min_inner_size([520.0, 400.0]),
+            // Flat 2D content: no depth, stencil or MSAA buffers.
+            depth_buffer: 0,
+            stencil_buffer: 0,
+            multisampling: 0,
             ..Default::default()
         },
         Box::new(|cc| Ok(Box::new(EditorApp::new(cc)))),

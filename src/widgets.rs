@@ -20,7 +20,25 @@ const TRAVEL_PER_SECOND: f32 = 0.25;
 /// Shared look for every window: larger text, roomier click targets and a
 /// pointing hand over anything clickable (egui keeps the native arrow unless
 /// asked, which is why hovering a button used to show no hand cursor).
+/// Drop the emoji fonts egui embeds by default.
+///
+/// Nothing here draws an emoji: the UI strings are ASCII and paths are Latin,
+/// which the proportional font covers. Skipping them saves a couple of
+/// megabytes of parsed font data and font-atlas space per window.
+fn install_fonts(ctx: &egui::Context) {
+    let mut fonts = egui::FontDefinitions::default();
+    let is_emoji = |name: &str| name.to_ascii_lowercase().contains("emoji");
+    fonts.font_data.retain(|name, _| !is_emoji(name));
+    for family in [egui::FontFamily::Proportional, egui::FontFamily::Monospace] {
+        if let Some(list) = fonts.families.get_mut(&family) {
+            list.retain(|name| !is_emoji(name));
+        }
+    }
+    ctx.set_fonts(fonts);
+}
+
 pub fn apply_style(ctx: &egui::Context) {
+    install_fonts(ctx);
     // Both themes are kept identical so the look cannot change under the app.
     ctx.all_styles_mut(|style| {
         let proportional = |size: f32| FontId::new(size, FontFamily::Proportional);

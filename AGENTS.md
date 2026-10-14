@@ -62,6 +62,19 @@
 - The wordmark lays out each glyph once and caches the galleys in egui temp data; per-frame it only
   paints them with fresh colours, and it stops requesting repaints when the window loses focus.
   Do not call `fonts_mut` inside `data_mut`: both take the context write lock and deadlock.
+- Memory: each window is its own process (winit allows one event loop per process) and pays for one
+  GL context + DWM-composited window on top of the egui context, so the *number of resident
+  processes* is the dominant term, not our heap. Measured app heap: launcher ~0.37 MiB, editor
+  ~0.43 MiB, overlay ~0.32 MiB, 0 bytes/frame over 1800 frames each. The launcher hands over to the
+  editor (and can also exit after launching the overlay, "close after launching") so a menu-like
+  window never stays resident next to the window it opened; detached children are dropped handles,
+  not kills - see `spawn_self` and `closes_after` in `launcher.rs`.
+- Memory diagnostics on a user's machine: every process logs its own working set once at startup
+  (`platform::working_set_mb`, one line per process in `vibehair.log`), so `Launcher`/`Editor`/
+  `Overlay` lines are directly comparable. `--stop` requests an overlay stop without opening a
+  window, which is how an overlay started in close-after-launch mode is stopped.
+- Fonts: `widgets::install_fonts` drops the emoji fonts egui embeds (nothing here draws one). UI
+  strings stay ASCII; non-ASCII text such as a user path is covered by the proportional font.
 - Diagnostics: `platform::log_line` writes `vibehair.log` next to the settings file, because a
   `windows_subsystem = "windows"` process has no visible stderr.
 - Windows release builds link the CRT statically (`.cargo/config.toml`); `release.yml` fails if
