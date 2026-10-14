@@ -1,9 +1,12 @@
 //! Startup selector: Open Editor / Launch Overlay.
+//!
+//! The chosen mode is spawned as a child process: winit allows exactly one
+//! event loop per process, so a second `run_native` in-process would fail.
+
+use std::process::Command;
 
 use eframe::egui::CentralPanel;
 use eframe::{App, CreationContext, Frame as EframeFrame, NativeOptions};
-
-use crate::{editor, overlay};
 
 enum Next {
     None,
@@ -11,13 +14,36 @@ enum Next {
     Overlay,
 }
 
+fn flag(next: &Next) -> Option<&'static str> {
+    match next {
+        Next::None => None,
+        Next::Editor => Some("--editor"),
+        Next::Overlay => Some("--overlay"),
+    }
+}
+
+/// Relaunch this exe with `flag`. Returns an error message for the UI on failure.
+fn spawn_self(flag: &str) -> Option<String> {
+    match std::env::current_exe() {
+        Ok(exe) => match Command::new(exe).arg(flag).spawn() {
+            Ok(_) => None,
+            Err(err) => Some(format!("launch failed: {err}")),
+        },
+        Err(err) => Some(format!("cannot locate own exe: {err}")),
+    }
+}
+
 pub struct LauncherApp {
     next: Next,
+    error: Option<String>,
 }
 
 impl LauncherApp {
     pub fn new(_cc: &CreationContext<'_>) -> Self {
-        Self { next: Next::None }
+        Self {
+            next: Next::None,
+            error: None,
+        }
     }
 }
 
@@ -29,11 +55,21 @@ impl App for LauncherApp {
                 ui.add_space(8.0);
                 if ui.button("open editor").clicked() {
                     self.next = Next::Editor;
-                    ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
                 }
                 if ui.button("launch overlay").clicked() {
                     self.next = Next::Overlay;
-                    ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
+                }
+                if let Some(flag) = flag(&self.next) {
+                    // Spawn first so a failure keeps the launcher open with an error.
+                    if let Some(err) = spawn_self(flag) {
+                        self.error = Some(err);
+                        self.next = Next::None;
+                    } else {
+                        ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
+                    }
+                }
+                if let Some(err) = &self.error {
+                    ui.small(err);
                 }
             });
         });
@@ -41,40 +77,27 @@ impl App for LauncherApp {
 }
 
 pub fn run() -> eframe::Result {
-    let chosen = std::rc::Rc::new(std::cell::Cell::new(0u8));
-    let chosen_in = chosen.clone();
     eframe::run_native(
         "vibehair",
         NativeOptions {
             viewport: egui::ViewportBuilder::default()
                 .with_title("vibehair")
-                .with_inner_size([260.0, 170.0])
+                .with_inner_size([260.0, 180.0])
                 .with_resizable(false),
-            run_and_return: true,
             ..Default::default()
         },
-        Box::new(move |cc| {
-            let chosen_in = chosen_in.clone();
-            Ok(Box::new(LauncherThen(chosen_in, LauncherApp::new(cc))) as Box<dyn App>)
-        }),
-    )?;
-    match chosen.get() {
-        1 => editor::run(),
-        2 => overlay::run(),
-        _ => Ok(()),
-    }
+        Box::new(|cc| Ok(Box::new(LauncherApp::new(cc)))),
+    )
 }
 
-/// Adapter: remembers the launcher choice, then closes.
-struct LauncherThen(std::rc::Rc<std::cell::Cell<u8>>, LauncherApp);
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-impl App for LauncherThen {
-    fn ui(&mut self, ui: &mut egui::Ui, frame: &mut EframeFrame) {
-        self.1.ui(ui, frame);
-        match self.1.next {
-            Next::Editor => self.0.set(1),
-            Next::Overlay => self.0.set(2),
-            Next::None => {}
-        }
+    #[test]
+    fn flags_map_to_modes() {
+        assert_eq!(flag(&Next::Editor), Some("--editor"));
+        assert_eq!(flag(&Next::Overlay), Some("--overlay"));
+        assert_eq!(flag(&Next::None), None);
     }
 }

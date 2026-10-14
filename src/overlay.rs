@@ -36,29 +36,25 @@ pub struct OverlayApp {
     settings: Settings,
     /// Window side in physical pixels, to detect resize needs.
     window_px: u32,
+    /// Last sent outer position in points; resend only on change.
+    last_pos: Option<(f32, f32)>,
     /// Frames left that must still repaint unconditionally (startup/DPI settle).
     settle_frames: u8,
 }
 
 impl OverlayApp {
-    pub fn new(cc: &CreationContext<'_>) -> Self {
+    pub fn new(_cc: &CreationContext<'_>) -> Self {
         let (settings, path, err) = config::load();
         if let Some(err) = err {
             eprintln!("vibehair: config {path:?}: {err}; using defaults");
         }
-        let (side, _) = window_size_px(
-            settings.shape,
-            settings.size,
-            settings.gap,
-            settings.thickness,
-        );
-        cc.egui_ctx
-            .send_viewport_cmd(egui::ViewportCommand::InnerSize(
-                egui::vec2(side as f32, side as f32) / cc.egui_ctx.pixels_per_point().max(1.0),
-            ));
+        // NOTE: no InnerSize here: `pixels_per_point` is still the default 1.0
+        // before the first update. The first `ui()` passes send it with the
+        // real scale while `settle_frames` runs (`window_px: 0` forces resend).
         Self {
             settings,
-            window_px: side,
+            window_px: 0,
+            last_pos: None,
             settle_frames: 3,
         }
     }
@@ -74,7 +70,7 @@ impl App for OverlayApp {
             self.settings.gap,
             self.settings.thickness,
         );
-        if side != self.window_px {
+        if side != self.window_px || self.settle_frames > 0 {
             self.window_px = side;
             ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(egui::vec2(
                 side as f32 / ppp,
@@ -83,17 +79,21 @@ impl App for OverlayApp {
             self.settle_frames = self.settle_frames.max(2);
         }
         // Re-center (cheap, idempotent): handles monitor/DPI/offset changes.
+        // `monitor_size` is in egui points; convert to physical px for the helper.
         let monitor = ctx
             .input(|i| i.viewport().monitor_size)
             .unwrap_or(egui::vec2(0.0, 0.0));
         if monitor.x > 1.0 && monitor.y > 1.0 {
             let (x, y) = window_outer_pos_points(
-                (monitor.x, monitor.y),
+                (monitor.x * ppp, monitor.y * ppp),
                 (side as f32, side as f32),
                 (self.settings.offset_x, self.settings.offset_y),
                 ppp,
             );
-            ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(egui::pos2(x, y)));
+            if self.last_pos != Some((x, y)) {
+                self.last_pos = Some((x, y));
+                ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(egui::pos2(x, y)));
+            }
         }
         if self.settle_frames > 0 {
             self.settle_frames -= 1;

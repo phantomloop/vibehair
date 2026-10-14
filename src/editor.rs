@@ -128,7 +128,9 @@ impl App for EditorApp {
             }
             if ui.button("launch overlay").clicked() {
                 self.save();
-                spawn_overlay();
+                if let Some(err) = spawn_overlay() {
+                    self.status = err;
+                }
             }
             ui.separator();
             ui.small(&self.status);
@@ -147,15 +149,14 @@ impl App for EditorApp {
     }
 }
 
-/// Relaunch this exe in overlay mode; logs failures to status via stderr.
-fn spawn_overlay() {
+/// Relaunch this exe in overlay mode; `Some(message)` on failure for the UI status line.
+fn spawn_overlay() -> Option<String> {
     match std::env::current_exe() {
-        Ok(exe) => {
-            if let Err(err) = std::process::Command::new(exe).arg("--overlay").spawn() {
-                eprintln!("vibehair: failed to launch overlay: {err}");
-            }
-        }
-        Err(err) => eprintln!("vibehair: cannot locate own exe: {err}"),
+        Ok(exe) => match std::process::Command::new(exe).arg("--overlay").spawn() {
+            Ok(_) => None,
+            Err(err) => Some(format!("launch overlay failed: {err}")),
+        },
+        Err(err) => Some(format!("cannot locate own exe: {err}")),
     }
 }
 

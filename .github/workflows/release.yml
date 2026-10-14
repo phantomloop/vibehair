@@ -75,7 +75,7 @@ jobs:
             dist/vibehair-windows-x86_64.exe
           generate_release_notes: false
           body: |
-            vibehair v0.1.0 — technical prototype.
+            vibehair ${{ github.ref_name }} — technical prototype.
 
             Manual verification on a real Windows + Hunt: Showdown 1896 machine is still outstanding.
             Overlay visibility, click-through, and game compatibility are NOT yet verified.
