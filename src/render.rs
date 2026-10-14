@@ -26,6 +26,17 @@ pub fn to_points(settings: &Settings, pixels_per_point: f32) -> Settings {
     }
 }
 
+/// Move `center` onto a whole physical pixel.
+pub fn snap_to_physical_pixel(center: Pos2, pixels_per_point: f32) -> Pos2 {
+    if !(pixels_per_point.is_finite() && pixels_per_point > 0.0) {
+        return center;
+    }
+    egui::pos2(
+        (center.x * pixels_per_point).round() / pixels_per_point,
+        (center.y * pixels_per_point).round() / pixels_per_point,
+    )
+}
+
 /// sRGB + opacity as an egui color. Uses unmultiplied input: the painter blends
 /// premultiplied, and `Color32` premultiplies on conversion.
 fn crosshair_color(settings: &Settings) -> Color32 {
@@ -42,13 +53,16 @@ fn crosshair_color(settings: &Settings) -> Color32 {
 /// `settings` lengths are physical pixels (as stored in the config and used to
 /// size the overlay window); `pixels_per_point` converts them to the points
 /// egui paints in, so the crosshair covers exactly as many display pixels as
-/// it does in the overlay.
+/// it does in the overlay. The center is snapped to whole physical pixels so
+/// the editor preview and the overlay rasterize identically and lines stay
+/// crisp instead of being blurred across half pixels.
 pub fn paint_crosshair(
     painter: &Painter,
     center: Pos2,
     settings: &Settings,
     pixels_per_point: f32,
 ) {
+    let center = snap_to_physical_pixel(center, pixels_per_point);
     let points = to_points(settings, pixels_per_point);
     if points.opacity <= 0.0 {
         return;
@@ -80,6 +94,7 @@ pub fn paint_crosshair(
 /// Same shapes as [`paint_crosshair`] but as data, for headless tests.
 #[cfg(test)]
 pub fn paint_shapes(center: Pos2, settings: &Settings, pixels_per_point: f32) -> Vec<EguiShape> {
+    let center = snap_to_physical_pixel(center, pixels_per_point);
     let points = to_points(settings, pixels_per_point);
     let mut shapes = Vec::new();
     if points.opacity <= 0.0 {
@@ -161,6 +176,28 @@ mod tests {
             panic!("expected line segment");
         };
         assert_eq!(points, [Pos2::new(54.0, 60.0), Pos2::new(64.0, 60.0)]);
+    }
+
+    #[test]
+    fn center_snaps_to_whole_physical_pixels() {
+        // At 1.5x, 2.3 points is 3.45 physical px and snaps to 3 px = 2.0 points.
+        let snapped = snap_to_physical_pixel(Pos2::new(2.3, 4.7), 1.5);
+        assert!((snapped.x - 2.0).abs() < 1e-6, "got {snapped:?}");
+        assert!((snapped.y - 7.0 / 1.5).abs() < 1e-6, "got {snapped:?}");
+        // Integer positions are untouched at any scale.
+        for ppp in [1.0, 1.25, 2.0] {
+            assert_eq!(
+                snap_to_physical_pixel(Pos2::new(8.0, 8.0), ppp),
+                Pos2::new(8.0, 8.0)
+            );
+        }
+        // Broken scales must not panic or move the point.
+        for bad in [0.0, -2.0, f32::NAN, f32::INFINITY] {
+            assert_eq!(
+                snap_to_physical_pixel(Pos2::new(3.3, 3.3), bad),
+                Pos2::new(3.3, 3.3)
+            );
+        }
     }
 
     #[test]
