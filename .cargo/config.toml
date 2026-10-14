@@ -1,0 +1,5 @@
+# Link the MSVC C runtime statically on Windows so the released .exe does not
+# require the Visual C++ redistributable (VCRUNTIME140.dll / api-ms-win-crt-*).
+# Release workflow asserts the built exe has no VCRUNTIME140 dependency.
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]

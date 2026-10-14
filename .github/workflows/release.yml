@@ -39,6 +39,17 @@ jobs:
         run: |
           test -s target/release/${{ matrix.bin }}
           ./target/release/${{ matrix.bin }} --bogus 2>/dev/null && exit 1 || test $? -eq 2
+      - name: assert no Visual C++ runtime dependency (windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $bytes = [System.IO.File]::ReadAllBytes("target/release/${{ matrix.bin }}")
+          $text = [System.Text.Encoding]::ASCII.GetString($bytes)
+          if ($text -match 'VCRUNTIME140|MSVCP140') {
+            Write-Error "vibehair.exe depends on the VC++ redistributable; expected a static CRT"
+            exit 1
+          }
+          Write-Output "no VC++ runtime import found (static CRT)"
       - name: stage asset
         shell: bash
         run: |
