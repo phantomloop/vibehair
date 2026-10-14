@@ -282,14 +282,14 @@ mod tests {
     #[test]
     fn overlay_requests_transparent_click_through_topmost() {
         let vb = viewport_builder();
-        assert_eq!(vb.transparent, Some(true));
         assert_eq!(vb.decorations, Some(false));
         #[cfg(not(target_os = "windows"))]
         {
             assert_eq!(vb.mouse_passthrough, Some(true));
             assert_eq!(vb.transparent, Some(true));
         }
-        // Windows configures the native window itself instead.
+        // Windows configures the native window itself instead: keyed color for
+        // transparency and WS_EX_TRANSPARENT for click-through.
         #[cfg(target_os = "windows")]
         {
             assert_eq!(vb.mouse_passthrough, None);
