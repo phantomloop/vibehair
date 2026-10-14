@@ -17,6 +17,13 @@
   `overlay` (transparent/topmost/click-through), `platform` (exe-dir/user-config paths).
 - Overlay window: small square sized to the crosshair, centered via `monitor_size` + manual
   X/Y offsets, event-driven repaint (no idle loop). Game offset is user-calibrated; never guess it.
+- Windows overlay: `mouse_passthrough` MUST NOT be used — it makes winit add `WS_EX_LAYERED`,
+  after which Windows stops compositing the window's per-pixel-alpha content and the crosshair
+  disappears (emilk/egui#2537, open). Click-through is applied in `platform_windows.rs` by
+  setting `WS_EX_TRANSPARENT` without `WS_EX_LAYERED`. Verify with
+  `cargo clippy --target x86_64-pc-windows-msvc --all-targets -- -D warnings` (target is installed).
+- Diagnostics: `platform::log_line` writes `vibehair.log` next to the settings file, because a
+  `windows_subsystem = "windows"` process has no visible stderr.
 - No game injection/hooks/drivers; plain user-space window. No telemetry.
 
 ## Working rules
