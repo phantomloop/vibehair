@@ -1,0 +1,82 @@
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - os: ubuntu-latest
+            asset: vibehair-linux-x86_64
+            bin: vibehair
+          - os: windows-latest
+            asset: vibehair-windows-x86_64.exe
+            bin: vibehair.exe
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: fmt
+        run: cargo fmt --all -- --check
+      - name: clippy
+        run: cargo clippy --all-targets -- -D warnings
+      - name: test
+        run: cargo test --all-targets
+      - name: release build
+        run: cargo build --release
+      - name: sanity check binary
+        shell: bash
+        run: |
+          test -s target/release/${{ matrix.bin }}
+          ./target/release/${{ matrix.bin }} --bogus 2>/dev/null && exit 1 || test $? -eq 2
+      - name: stage asset
+        shell: bash
+        run: |
+          mkdir -p dist
+          cp target/release/${{ matrix.bin }} dist/${{ matrix.asset }}
+      - name: upload asset
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.asset }}
+          path: dist/${{ matrix.asset }}
+          if-no-files-found: error
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: verify assets
+        run: |
+          ls -la dist
+          test -s dist/vibehair-linux-x86_64
+          test -s dist/vibehair-windows-x86_64.exe
+      - name: create release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/vibehair-linux-x86_64
+            dist/vibehair-windows-x86_64.exe
+          generate_release_notes: false
+          body: |
+            vibehair v0.1.0 — technical prototype.
+
+            Manual verification on a real Windows + Hunt: Showdown 1896 machine is still outstanding.
+            Overlay visibility, click-through, and game compatibility are NOT yet verified.
+            See the repository for details.

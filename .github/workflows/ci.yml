@@ -1,0 +1,45 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: fmt
+        run: cargo fmt --all -- --check
+      - name: clippy
+        run: cargo clippy --all-targets -- -D warnings
+      - name: test
+        run: cargo test --all-targets
+      - name: release build
+        run: cargo build --release
+      - name: smoke CLI
+        shell: bash
+        run: |
+          ./target/release/vibehair --help || test $? -eq 2
+          ./target/release/vibehair --bogus 2>/dev/null && exit 1 || test $? -eq 2
+      - name: upload binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: vibehair-${{ matrix.os }}
+          path: |
+            target/release/vibehair
+            target/release/vibehair.exe
+          if-no-files-found: error

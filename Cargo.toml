@@ -5,6 +5,10 @@ edition = "2024"
 description = "A minimalist crosshair game overlay for Windows and Linux."
 
 [dependencies]
+eframe = { version = "0.36", default-features = false, features = ["glow", "x11", "wayland", "default_fonts"] }
+egui = { version = "0.36", default-features = false }
+serde = { version = "1", features = ["derive"] }
+toml = "1"
 
 [profile.release]
 lto = "thin"
