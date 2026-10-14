@@ -7,6 +7,8 @@ mod geometry;
 mod launcher;
 mod overlay;
 mod platform;
+#[cfg(target_os = "windows")]
+mod platform_windows;
 mod render;
 mod state;
 
@@ -17,13 +19,17 @@ fn main() -> eframe::Result {
     let mode = match state::parse_args(&args) {
         Ok(mode) => mode,
         Err(msg) => {
-            eprintln!("{msg}");
+            platform::log_line(&msg);
             std::process::exit(2);
         }
     };
-    match mode {
+    let result = match mode {
         state::Mode::Launcher => launcher::run(),
         state::Mode::Editor => editor::run(),
         state::Mode::Overlay => overlay::run(),
+    };
+    if let Err(err) = &result {
+        platform::log_line(&format!("vibehair: {mode:?} failed: {err}"));
     }
+    result
 }

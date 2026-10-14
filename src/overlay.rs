@@ -20,17 +20,46 @@ use crate::geometry::{window_outer_pos_points, window_size_px};
 use crate::render::paint_crosshair;
 
 /// Viewport flags for the overlay window. Shared so tests can assert intent.
+///
+/// Click-through is deliberately left to [`click_through`] on Windows: winit's
+/// `mouse_passthrough` would set `WS_EX_LAYERED`, and Windows then stops
+/// compositing our per-pixel-alpha content, so the window looks empty
+/// (emilk/egui#2537, still open upstream). Other platforms keep using it.
 pub fn viewport_builder() -> egui::ViewportBuilder {
-    egui::ViewportBuilder::default()
+    let builder = egui::ViewportBuilder::default()
         .with_title("vibehair overlay")
         .with_transparent(true)
         .with_decorations(false)
         .with_resizable(false)
         .with_always_on_top()
-        .with_mouse_passthrough(true)
         .with_taskbar(false)
         .with_has_shadow(false)
-        .with_active(false)
+        .with_active(false);
+    if cfg!(target_os = "windows") {
+        builder
+    } else {
+        builder.with_mouse_passthrough(true)
+    }
+}
+
+/// Make the overlay click-through, without turning it invisible.
+///
+/// Called once per process; failures are logged, never fatal.
+fn click_through(frame: &mut EframeFrame) {
+    #[cfg(target_os = "windows")]
+    {
+        let Some(window) = frame.winit_window().cloned() else {
+            crate::platform::log_line("vibehair: overlay window handle unavailable");
+            return;
+        };
+        if let Err(err) = crate::platform_windows::make_click_through(&window) {
+            crate::platform::log_line(&format!("vibehair: click-through failed: {err}"));
+        }
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = frame;
+    }
 }
 
 /// Window side in physical pixels for these settings.
@@ -109,13 +138,15 @@ pub struct OverlayApp {
     monitor_wait: u8,
     /// Holds the single-instance lock for the process lifetime, when available.
     _lock: Option<File>,
+    /// Click-through is applied once, as soon as a window handle exists.
+    click_through_done: bool,
 }
 
 impl OverlayApp {
     pub fn new(_cc: &CreationContext<'_>, lock: Option<File>) -> Self {
         let (settings, path, err) = config::load();
         if let Some(err) = err {
-            eprintln!("vibehair: config {path:?}: {err}; using defaults");
+            crate::platform::log_line(&format!("vibehair: config {path:?}: {err}; using defaults"));
         }
         // No viewport commands here: `pixels_per_point` is still its default
         // 1.0 before the first update. The first `ui()` pass applies the real
@@ -126,12 +157,17 @@ impl OverlayApp {
             settle_frames: 0,
             monitor_wait: 8,
             _lock: lock,
+            click_through_done: false,
         }
     }
 }
 
 impl App for OverlayApp {
-    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut EframeFrame) {
+    fn ui(&mut self, ui: &mut egui::Ui, frame: &mut EframeFrame) {
+        if !self.click_through_done {
+            self.click_through_done = true;
+            click_through(frame);
+        }
         let ctx = ui.ctx().clone();
         let ppp = ctx.pixels_per_point().max(0.5);
         let side = desired_side_px(&self.settings);
@@ -194,12 +230,14 @@ pub fn run() -> eframe::Result {
     let lock = match acquire_overlay_lock() {
         Ok(Some(lock)) => Some(lock),
         Ok(None) => {
-            eprintln!("vibehair: an overlay is already running");
+            crate::platform::log_line("vibehair: an overlay is already running");
             return Ok(());
         }
         Err(err) => {
             // A broken/unsupported lock file must not disable the overlay.
-            eprintln!("vibehair: {err}; continuing without single-instance guard");
+            crate::platform::log_line(&format!(
+                "vibehair: {err}; continuing without single-instance guard"
+            ));
             None
         }
     };
@@ -235,7 +273,11 @@ mod tests {
         let vb = viewport_builder();
         assert_eq!(vb.transparent, Some(true));
         assert_eq!(vb.decorations, Some(false));
+        #[cfg(not(target_os = "windows"))]
         assert_eq!(vb.mouse_passthrough, Some(true));
+        // Windows applies WS_EX_TRANSPARENT itself instead (see overlay::click_through).
+        #[cfg(target_os = "windows")]
+        assert_eq!(vb.mouse_passthrough, None);
         assert_eq!(vb.window_level, Some(egui::WindowLevel::AlwaysOnTop));
         assert_eq!(vb.resizable, Some(false));
     }
@@ -312,6 +354,49 @@ mod tests {
         let (x2, y2) = desired_outer_points(&s, side, egui::vec2(1920.0, 1080.0), 2.0);
         assert_eq!(x2, (3840.0 - side_f) / 4.0 + 5.0);
         assert_eq!(y2, (2160.0 - side_f) / 4.0 - 10.0);
+    }
+
+    /// The overlay must emit the crosshair itself: opaque, centered, inside
+    /// the viewport. Guards against "window is transparent but nothing shows".
+    #[test]
+    fn overlay_emits_an_opaque_centered_crosshair() {
+        let ctx = egui::Context::default();
+        let lock = try_lock_file(&scratch("emit").join("a.lock")).unwrap();
+        let cc = CreationContext::_new_kittest(ctx.clone());
+        let mut app = OverlayApp::new(&cc, lock);
+
+        let mut frame = EframeFrame::_new_kittest();
+        let mut output = ctx.run_ui(egui::RawInput::default(), |ui| {
+            app.ui(ui, &mut frame);
+        });
+        output.textures_delta.clear(); // headless: nothing renders the textures
+        let raw_input = output.viewport_output.keys().count();
+        assert!(raw_input > 0);
+
+        let mut segments = Vec::new();
+        for clipped in &output.shapes {
+            if let egui::Shape::LineSegment { points, stroke } = &clipped.shape {
+                segments.push((points, stroke));
+            }
+        }
+        assert_eq!(segments.len(), 4, "one crosshair = four arms");
+
+        let rect = ctx.viewport_rect();
+        let center = rect.center();
+        for (points, stroke) in &segments {
+            assert_eq!(stroke.color.a(), 255, "crosshair arms must be opaque");
+            assert_eq!(stroke.color.g(), 255, "default crosshair color is green");
+            for point in *points {
+                assert!(rect.contains(*point), "{point:?} must be inside {rect:?}");
+            }
+        }
+        // Defaults: size 8, gap 4 => arms run from 4px to 12px off-center.
+        let (horizontal, _) = segments[0];
+        assert_eq!(horizontal[0], center + egui::vec2(4.0, 0.0));
+        assert_eq!(horizontal[1], center + egui::vec2(12.0, 0.0));
+        let (vertical, _) = segments[2];
+        assert_eq!(vertical[0], center + egui::vec2(0.0, 4.0));
+        assert_eq!(vertical[1], center + egui::vec2(0.0, 12.0));
     }
 
     #[test]

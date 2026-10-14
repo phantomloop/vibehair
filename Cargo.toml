@@ -10,6 +10,11 @@ egui = { version = "0.36", default-features = false }
 serde = { version = "1", features = ["derive"] }
 toml = "1"
 
+# Needed for the platform window handle behind the Windows click-through
+# workaround; already in the tree via eframe on every platform.
+[target.'cfg(target_os = "windows")'.dependencies]
+winit = { version = "0.30", default-features = false }
+
 [profile.release]
 lto = "thin"
 codegen-units = 1
